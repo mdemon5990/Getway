@@ -1,11 +1,12 @@
+
 services:
   - type: web
     name: payment-bridge-gateway
     runtime: docker
     plan: free
     region: singapore
-    dockerfilePath: ./Backend/Dockerfile
-    dockerContext: ./Backend
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /api/health
     envVars:
       - key: PB_FIREBASE_DATABASE_URL
