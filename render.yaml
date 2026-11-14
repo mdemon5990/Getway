@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: payment-bridge-gateway
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Backend/Dockerfile
+    dockerContext: ./Backend
+    healthCheckPath: /api/health
+    envVars:
+      - key: PB_FIREBASE_DATABASE_URL
+        value: https://getway-2551b-default-rtdb.firebaseio.com
+      - key: PB_FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: PB_KEY_PEPPER
+        generateValue: true
+      - key: PB_ADMIN_PASSWORD
+        sync: false
+      - key: TZ
+        value: Asia/Dhaka
