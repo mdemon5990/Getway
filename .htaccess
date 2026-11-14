@@ -1,0 +1,8 @@
+Options -Indexes
+RewriteEngine On
+RewriteRule ^api/([A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*)/?$ index.php [QSA,L]
+RewriteRule ^admin/?$ index.php [QSA,L]
+RewriteRule ^apikey=.*$ index.php [QSA,L]
+<FilesMatch "^(\.env|.*\.(json|ya?ml|md|sh|zip|log|txt))$">
+    Require all denied
+</FilesMatch>
