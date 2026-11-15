@@ -50,24 +50,28 @@ function current_route(): string {
     if ($path === '/health' || $path === '/health/') return 'api/health';
     return '';
 }
-function service_account(): array {
-    $sa = json_decode(envv('PB_FIREBASE_SERVICE_ACCOUNT_JSON'), true);
+function firebase_slot_enabled(int $slot): bool {
+    return $slot === 2 && envv('PB_FIREBASE_DATABASE_URL_2') !== '' && envv('PB_FIREBASE_SERVICE_ACCOUNT_JSON_2') !== '';
+}
+function service_account(int $slot = 1): array {
+    $suffix = $slot === 2 ? '_2' : '';
+    $sa = json_decode(envv('PB_FIREBASE_SERVICE_ACCOUNT_JSON' . $suffix), true);
     if (!is_array($sa) || empty($sa['client_email']) || empty($sa['private_key']) || empty($sa['token_uri'])) {
         throw new RuntimeException('Firebase service account configuration is invalid.');
     }
     $sa['private_key'] = str_replace('\\n', "\n", (string)$sa['private_key']);
     return $sa;
 }
-function firebase_token(): string {
-    static $token = '';
-    static $expiry = 0;
-    if ($token !== '' && $expiry > time() + 90) return $token;
-    $sa = service_account();
-    $cacheFile = sys_get_temp_dir() . '/pb_oauth_' . preg_replace('/[^a-zA-Z0-9_-]/', '', (string)($sa['project_id'] ?? 'project')) . '.json';
+function firebase_token(int $slot = 1): string {
+    static $tokens = [];
+    static $expiries = [];
+    if (!empty($tokens[$slot]) && ($expiries[$slot] ?? 0) > time() + 90) return $tokens[$slot];
+    $sa = service_account($slot);
+    $cacheFile = sys_get_temp_dir() . '/pb_oauth_' . $slot . '_' . preg_replace('/[^a-zA-Z0-9_-]/', '', (string)($sa['project_id'] ?? 'project')) . '.json';
     if (is_file($cacheFile)) {
         $cached = json_decode((string)@file_get_contents($cacheFile), true);
         if (is_array($cached) && !empty($cached['access_token']) && (int)($cached['expires_at'] ?? 0) > time() + 90) {
-            $token = (string)$cached['access_token']; $expiry = (int)$cached['expires_at']; return $token;
+            $tokens[$slot] = (string)$cached['access_token']; $expiries[$slot] = (int)$cached['expires_at']; return $tokens[$slot];
         }
     }
     $now = time();
@@ -95,17 +99,19 @@ function firebase_token(): string {
     if ($code < 200 || $code >= 300 || !is_array($data) || empty($data['access_token'])) {
         throw new RuntimeException('Firebase server authentication failed (HTTP ' . $code . '). ' . $err);
     }
-    $token = (string)$data['access_token']; $expiry = $now + (int)($data['expires_in'] ?? 3500);
-    @file_put_contents($cacheFile, json_encode(['access_token' => $token, 'expires_at' => $expiry]), LOCK_EX);
+    $tokens[$slot] = (string)$data['access_token']; $expiries[$slot] = $now + (int)($data['expires_in'] ?? 3500);
+    @file_put_contents($cacheFile, json_encode(['access_token' => $tokens[$slot], 'expires_at' => $expiries[$slot]]), LOCK_EX);
     @chmod($cacheFile, 0600);
-    return $token;
+    return $tokens[$slot];
 }
-function fb_request(string $method, string $path, $payload = null, array $extraHeaders = [], array $query = [], float $timeoutSeconds = 12.0): array {
-    $base = rtrim(envv('PB_FIREBASE_DATABASE_URL'), '/');
+function fb_request_target(int $slot, string $method, string $path, $payload = null, array $extraHeaders = [], array $query = [], float $timeoutSeconds = 12.0): array {
+    $suffix = $slot === 2 ? '_2' : '';
+    $base = rtrim(envv('PB_FIREBASE_DATABASE_URL' . $suffix), '/');
+    if ($base === '') throw new RuntimeException('Firebase database target is not configured.');
     $segments = array_map('rawurlencode', array_filter(explode('/', trim($path, '/')), 'strlen'));
     $url = $base . '/' . implode('/', $segments) . '.json';
     if ($query) $url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
-    $headers = array_merge(['Authorization: Bearer ' . firebase_token(), 'Accept: application/json'], $extraHeaders);
+    $headers = array_merge(['Authorization: Bearer ' . firebase_token($slot), 'Accept: application/json'], $extraHeaders);
     if ($payload !== null) $headers[] = 'Content-Type: application/json';
     $responseHeaders = [];
     $ch = curl_init($url);
@@ -126,6 +132,33 @@ function fb_request(string $method, string $path, $payload = null, array $extraH
     if ($body === false) throw new RuntimeException('Firebase network error: ' . $error);
     return ['code' => $code, 'body' => (string)$body, 'json' => json_decode((string)$body, true), 'headers' => $responseHeaders];
 }
+function fb_request(string $method, string $path, $payload = null, array $extraHeaders = [], array $query = [], float $timeoutSeconds = 12.0): array {
+    try {
+        $primary = fb_request_target(1, $method, $path, $payload, $extraHeaders, $query, $timeoutSeconds);
+        if ($primary['code'] >= 200 && $primary['code'] < 500) return $primary;
+        if (!firebase_slot_enabled(2)) return $primary;
+    } catch (Throwable $primaryError) {
+        if (!firebase_slot_enabled(2)) throw $primaryError;
+    }
+    try {
+        $secondary = fb_request_target(2, $method, $path, $payload, $extraHeaders, $query, $timeoutSeconds);
+        if ($secondary['code'] >= 200 && $secondary['code'] < 500) return $secondary;
+        throw new RuntimeException('Primary and secondary Firebase databases returned an error.');
+    } catch (Throwable $secondaryError) {
+        throw new RuntimeException('Primary/secondary Firebase connection failed. ' . $secondaryError->getMessage());
+    }
+}
+function mirror_database_write(string $method, string $path, array $data): void {
+    if (!firebase_slot_enabled(2)) return;
+    try {
+        $r = fb_request_target(2, $method, $path, $data, [], [], 4.0);
+        if ($r['code'] < 200 || $r['code'] >= 300) throw new RuntimeException('HTTP ' . $r['code']);
+        $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'healthy';
+    } catch (Throwable $e) {
+        $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'degraded';
+        @file_put_contents(sys_get_temp_dir() . '/pb_secondary_db_status.json', json_encode(['status'=>'degraded','at'=>time()]), LOCK_EX);
+    }
+}
 function fb_get(string $path): array {
     $r = fb_request('GET', $path);
     if ($r['code'] < 200 || $r['code'] >= 300) throw new RuntimeException('Firebase read failed at ' . $path . ' (HTTP ' . $r['code'] . ').');
@@ -137,38 +170,88 @@ function fb_query(string $path, array $query): array {
     return is_array($r['json']) ? $r['json'] : [];
 }
 function fb_write(string $method, string $path, array $data): void {
-    $r = fb_request($method, $path, $data);
-    if ($r['code'] < 200 || $r['code'] >= 300) throw new RuntimeException('Firebase write failed at ' . $path . ' (HTTP ' . $r['code'] . ').');
+    try {
+        $r = fb_request_target(1, $method, $path, $data);
+        if ($r['code'] < 200 || $r['code'] >= 300) throw new RuntimeException('Primary Firebase write returned HTTP ' . $r['code'] . '.');
+    } catch (Throwable $primaryError) {
+        if (!firebase_slot_enabled(2)) throw new RuntimeException('Firebase write failed at ' . $path . ': ' . $primaryError->getMessage());
+        $fallback = fb_request_target(2, $method, $path, $data);
+        if ($fallback['code'] < 200 || $fallback['code'] >= 300) throw new RuntimeException('Both Firebase databases rejected the write.');
+        $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'primary-failover';
+        return;
+    }
+    mirror_database_write($method, $path, $data);
 }
 function fb_delete(string $path): void {
-    $r = fb_request('DELETE', $path);
-    if ($r['code'] < 200 || $r['code'] >= 300) throw new RuntimeException('Firebase delete failed (HTTP ' . $r['code'] . ').');
+    try {
+        $r = fb_request_target(1, 'DELETE', $path);
+        if ($r['code'] < 200 || $r['code'] >= 300) throw new RuntimeException('Primary Firebase delete returned HTTP ' . $r['code'] . '.');
+    } catch (Throwable $primaryError) {
+        if (!firebase_slot_enabled(2)) throw new RuntimeException('Firebase delete failed: ' . $primaryError->getMessage());
+        $fallback = fb_request_target(2, 'DELETE', $path);
+        if ($fallback['code'] < 200 || $fallback['code'] >= 300) throw new RuntimeException('Both Firebase databases rejected the delete.');
+        $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'primary-failover';
+        return;
+    }
+    if (firebase_slot_enabled(2)) {
+        try { $r2 = fb_request_target(2, 'DELETE', $path, null, [], [], 4.0); if ($r2['code'] < 200 || $r2['code'] >= 300) throw new RuntimeException('HTTP ' . $r2['code']); $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'healthy'; }
+        catch (Throwable $e) { $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'degraded'; @file_put_contents(sys_get_temp_dir() . '/pb_secondary_db_status.json', json_encode(['status'=>'degraded','at'=>time()]), LOCK_EX); }
+    }
 }
-function fb_create_only(string $path, array $data): bool {
-    $read = fb_request('GET', $path, null, ['X-Firebase-ETag: true']);
+function fb_create_only_target(int $slot, string $path, array $data): bool {
+    $read = fb_request_target($slot, 'GET', $path, null, ['X-Firebase-ETag: true']);
     if ($read['code'] < 200 || $read['code'] >= 300) throw new RuntimeException('Firebase duplicate lookup failed (HTTP ' . $read['code'] . ').');
     if (trim($read['body']) !== '' && trim($read['body']) !== 'null') return false;
     $etag = (string)($read['headers']['etag'] ?? '');
     if ($etag === '') throw new RuntimeException('Firebase did not provide an ETag.');
-    $write = fb_request('PUT', $path, $data, ['If-Match: ' . $etag]);
+    $write = fb_request_target($slot, 'PUT', $path, $data, ['If-Match: ' . $etag]);
     if ($write['code'] === 412) return false;
     if ($write['code'] < 200 || $write['code'] >= 300) throw new RuntimeException('Firebase atomic create failed (HTTP ' . $write['code'] . ').');
     return true;
 }
-function fb_atomic_add(string $path, array $delta, int $retries = 8, float $timeoutSeconds = 12.0): void {
+function fb_create_only(string $path, array $data): bool {
+    try {
+        $created = fb_create_only_target(1, $path, $data);
+    } catch (Throwable $primaryError) {
+        if (!firebase_slot_enabled(2)) throw $primaryError;
+        $created = fb_create_only_target(2, $path, $data);
+        $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'primary-failover';
+        return $created;
+    }
+    if (firebase_slot_enabled(2)) {
+        try { fb_create_only_target(2, $path, $data); $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'healthy'; }
+        catch (Throwable $e) { $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'degraded'; @file_put_contents(sys_get_temp_dir() . '/pb_secondary_db_status.json', json_encode(['status'=>'degraded','at'=>time()]), LOCK_EX); }
+    }
+    return $created;
+}
+function fb_atomic_add_target(int $slot, string $path, array $delta, int $retries = 8, float $timeoutSeconds = 12.0): void {
     for ($i = 0; $i < $retries; $i++) {
-        $r = fb_request('GET', $path, null, ['X-Firebase-ETag: true'], [], $timeoutSeconds);
+        $r = fb_request_target($slot, 'GET', $path, null, ['X-Firebase-ETag: true'], [], $timeoutSeconds);
         if ($r['code'] < 200 || $r['code'] >= 300) throw new RuntimeException('Firebase aggregate read failed.');
         $current = is_array($r['json']) ? $r['json'] : [];
         foreach ($delta as $field => $value) $current[$field] = (float)($current[$field] ?? 0) + (float)$value;
         $etag = (string)($r['headers']['etag'] ?? '');
         if ($etag === '') throw new RuntimeException('Firebase aggregate ETag missing.');
-        $w = fb_request('PUT', $path, $current, ['If-Match: ' . $etag], [], $timeoutSeconds);
+        $w = fb_request_target($slot, 'PUT', $path, $current, ['If-Match: ' . $etag], [], $timeoutSeconds);
         if ($w['code'] >= 200 && $w['code'] < 300) return;
         if ($w['code'] !== 412) throw new RuntimeException('Firebase aggregate write failed (HTTP ' . $w['code'] . ').');
         usleep(20000 * ($i + 1));
     }
     throw new RuntimeException('Firebase aggregate contention; retry later.');
+}
+function fb_atomic_add(string $path, array $delta, int $retries = 8, float $timeoutSeconds = 12.0): void {
+    try {
+        fb_atomic_add_target(1, $path, $delta, $retries, $timeoutSeconds);
+    } catch (Throwable $primaryError) {
+        if (!firebase_slot_enabled(2)) throw $primaryError;
+        fb_atomic_add_target(2, $path, $delta, $retries, min(4.0, $timeoutSeconds));
+        $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'primary-failover';
+        return;
+    }
+    if (firebase_slot_enabled(2)) {
+        try { fb_atomic_add_target(2, $path, $delta, $retries, min(4.0, $timeoutSeconds)); $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'healthy'; }
+        catch (Throwable $e) { $GLOBALS['PB_SECONDARY_DB_STATUS'] = 'degraded'; @file_put_contents(sys_get_temp_dir() . '/pb_secondary_db_status.json', json_encode(['status'=>'degraded','at'=>time()]), LOCK_EX); }
+    }
 }
 function add_sharded_totals(string $root, array $delta, float $timeoutSeconds = 12.0): void {
     $shard = sprintf('%02d', random_int(0, 31));
@@ -436,7 +519,9 @@ function api_ingest(array $body): void {
                 ]);
             } catch (Throwable $ignored) {}
         }
-        try { fb_write('PATCH', 'payment_txn_index/' . hash('sha256', $txnId), [$method => $txnKey]); } catch (Throwable $ignored) {}
+        $txnLookupHash = hash('sha256', $txnId);
+        try { fb_write('PATCH', 'payment_txn_index/' . $txnLookupHash, [$method => $txnKey]); } catch (Throwable $ignored) {}
+        try { fb_write('PATCH', 'payment_txn_lookup/' . $txnLookupHash, [$method => $txnKey]); } catch (Throwable $ignored) {}
     }
     update_device_seen($deviceId, $body, $auth['key']['hash'], 'active');
     json_out(200, ['ok' => true, 'sms_saved' => $smsSaved, 'transaction_saved' => $txnSaved, 'duplicate_transaction' => $txnDuplicate, 'transaction_key' => $txnKey, 'message' => $txnDuplicate ? 'SMS stored; transaction already exists.' : 'Payment SMS accepted.']);
@@ -446,16 +531,21 @@ function normalize_number(string $value): string {
     if (strpos($digits, '880') === 0 && strlen($digits) >= 13) $digits = '0' . substr($digits, 3);
     return $digits;
 }
-function add_api_metric(string $result): void {
+function add_api_metric(string $result, string $keyHash = ''): void {
     $month = date('Y-m'); $day = date('Y-m-d');
     $delta = ['requests' => 1];
     $field = 'result_' . preg_replace('/[^a-z_]/', '', $result);
     $delta[$field] = 1;
+    if (preg_match('/^[a-f0-9]{64}$/i', $keyHash)) {
+        $prefix = 'key_' . substr(strtolower($keyHash), 0, 24) . '_';
+        $delta[$prefix . 'requests'] = 1;
+        $delta[$prefix . $field] = 1;
+    }
     try { add_sharded_totals('metrics/api_monthly/' . $month, $delta, 1.0); } catch (Throwable $ignored) {}
     try { add_sharded_totals('metrics/api_daily/' . $day, $delta, 1.0); } catch (Throwable $ignored) {}
 }
 function verify_response(bool $ok, string $result, string $message, ?array $record = null, array $extra = []): void {
-    add_api_metric($result);
+    add_api_metric($result, (string)($GLOBALS['PB_CURRENT_VERIFY_KEY_HASH'] ?? ''));
     $out = ['status' => $ok, 'result' => $result, 'message' => $message];
     if ($record !== null) {
         $out = array_merge($out, [
@@ -497,7 +587,7 @@ function update_verify_attempt(string $path): array {
         $record['last_verify_attempt_at'] = time();
         $etag = (string)($r['headers']['etag'] ?? '');
         $w = fb_request('PUT', $path, $record, ['If-Match: ' . $etag]);
-        if ($w['code'] >= 200 && $w['code'] < 300) return $record;
+        if ($w['code'] >= 200 && $w['code'] < 300) { mirror_database_write('PUT', $path, $record); return $record; }
         if ($w['code'] !== 412) throw new RuntimeException('Could not save verification attempt.');
     }
     throw new RuntimeException('Verification update busy.');
@@ -512,9 +602,27 @@ function query_candidate(string $method, string $txnId, float $timeoutSeconds = 
 }
 function query_candidates_for_txn(string $txnId, float $timeoutSeconds, bool $allowLegacyFallback = true): array {
     $endAt = microtime(true) + max(0.2, $timeoutSeconds);
+    $lookupPath = 'payment_txn_lookup/' . hash('sha256', $txnId);
+    $remaining = max(0.2, $endAt - microtime(true));
+    $lookup = fb_request('GET', $lookupPath, null, [], [], min(0.8, $remaining));
+    if ($lookup['code'] < 200 || $lookup['code'] >= 300) throw new RuntimeException('Fast transaction index lookup failed (HTTP ' . $lookup['code'] . ').');
+    $lookupMap = is_array($lookup['json']) ? $lookup['json'] : [];
+    $fastCandidates = [];
+    foreach ($lookupMap as $method => $key) {
+        $cleanMethod = strtolower((string)$method);
+        $cleanKey = strtolower(preg_replace('/[^a-f0-9]/', '', (string)$key));
+        if (in_array($cleanMethod, ['bkash','nagad','rocket'], true) && strlen($cleanKey) === 64) {
+            $fastCandidates[] = ['path'=>'payment_transactions/' . $cleanKey, 'key'=>$cleanKey,
+                'record'=>['method'=>$cleanMethod,'txn_id'=>$txnId], 'etag'=>''];
+        }
+    }
+    if ($fastCandidates) return $fastCandidates;
+    // Backward-compatible index fallback is run only once per API request.
+    // New SMS uploads write the fast lookup node, so later polls are a single indexed read.
+    if (!$allowLegacyFallback) return [];
     $indexPath = 'payment_txn_index/' . hash('sha256', $txnId);
     $remaining = max(0.2, $endAt - microtime(true));
-    $index = fb_request('GET', $indexPath, null, [], [], min(1.0, $remaining));
+    $index = fb_request('GET', $indexPath, null, [], [], min(0.8, $remaining));
     if ($index['code'] < 200 || $index['code'] >= 300) throw new RuntimeException('Transaction index lookup failed (HTTP ' . $index['code'] . ').');
     $indexMap = is_array($index['json']) ? $index['json'] : [];
     $candidateKeys = [];
@@ -524,28 +632,14 @@ function query_candidates_for_txn(string $txnId, float $timeoutSeconds, bool $al
         if (in_array($cleanMethod, ['bkash','nagad','rocket'], true) && strlen($cleanKey) === 64) $candidateKeys[$cleanMethod] = $cleanKey;
     }
     $candidates = [];
-    if ($candidateKeys) {
-        foreach ($candidateKeys as $method => $key) {
-            $remaining = $endAt - microtime(true);
-            if ($remaining <= 0.15) break;
-            $path = 'payment_transactions/' . $key;
-            $r = fb_request('GET', $path, null, ['X-Firebase-ETag: true'], [], min(1.5, max(0.2, $remaining)));
-            if ($r['code'] >= 200 && $r['code'] < 300 && is_array($r['json'])) {
-                $candidates[] = ['path'=>$path, 'key'=>$key, 'record'=>$r['json'], 'etag'=>(string)($r['headers']['etag'] ?? '')];
-            }
-        }
-        return $candidates;
-    }
-    // Backward-compatible fallback runs once per request only. Repeating three legacy
-    // lookups on every poll would overload Firebase when many callers wait for a new SMS.
-    if (!$allowLegacyFallback) return [];
-    $methods = ['bkash','nagad','rocket'];
-    foreach ($methods as $method) {
+    foreach ($candidateKeys as $method => $key) {
         $remaining = $endAt - microtime(true);
         if ($remaining <= 0.15) break;
-        $perCall = max(0.2, min(0.8, $remaining / max(1, count($methods))));
-        $candidate = query_candidate($method, $txnId, $perCall);
-        if ($candidate !== null) $candidates[] = $candidate;
+        $path = 'payment_transactions/' . $key;
+        $r = fb_request('GET', $path, null, ['X-Firebase-ETag: true'], [], min(1.0, max(0.2, $remaining)));
+        if ($r['code'] >= 200 && $r['code'] < 300 && is_array($r['json'])) {
+            $candidates[] = ['path'=>$path, 'key'=>$key, 'record'=>$r['json'], 'etag'=>(string)($r['headers']['etag'] ?? '')];
+        }
     }
     return $candidates;
 }
@@ -553,22 +647,24 @@ function api_verify(array $input): void {
     $apiKey = trim(header_value('X-API-Key'));
     if ($apiKey === '') $apiKey = trim((string)($input['apikey'] ?? ''));
     $key = verification_key_record($apiKey);
+    $GLOBALS['PB_CURRENT_VERIFY_KEY_HASH'] = (string)$key['hash'];
     $keyRecord = is_array($key['record'] ?? null) ? $key['record'] : [];
     $rate = verification_rate_limit((string)$key['hash'], (int)($keyRecord['rate_limit_per_min'] ?? 0));
     if (empty($rate['allowed'])) {
         header('Retry-After: ' . max(1, (int)$rate['retry_after']));
         header('X-RateLimit-Limit: ' . (int)$rate['limit']);
         header('X-RateLimit-Remaining: 0');
+        add_api_metric('rate_limited', (string)$key['hash']);
         json_out(429, ['status'=>false, 'result'=>'rate_limited', 'message'=>'Verification API rate limit reached. Retry after the indicated time.', 'limit_per_minute'=>$rate['limit'], 'remaining'=>0, 'retry_after_seconds'=>$rate['retry_after']]);
     }
     header('X-RateLimit-Limit: ' . (int)$rate['limit']);
     header('X-RateLimit-Remaining: ' . (int)$rate['remaining']);
     $settings = array_merge([
         'verify_number' => false, 'verify_amount' => true, 'verify_txn_id' => true,
-        'verify_method' => true, 'wait_seconds' => 10, 'poll_interval_ms' => 1000
+        'verify_method' => true, 'wait_seconds' => 10, 'poll_interval_ms' => 250
     ], fb_get('settings/verification'));
     $settings['wait_seconds'] = max(0, min(60, (int)($keyRecord['wait_seconds'] ?? $settings['wait_seconds'])));
-    $settings['poll_interval_ms'] = max(250, min(5000, (int)($keyRecord['poll_interval_ms'] ?? $settings['poll_interval_ms'])));
+    $settings['poll_interval_ms'] = max(150, min(3000, (int)($keyRecord['poll_interval_ms'] ?? $settings['poll_interval_ms'])));
     $checks = [
         'number' => !empty($settings['verify_number']),
         'amount' => !empty($settings['verify_amount']),
@@ -592,7 +688,7 @@ function api_verify(array $input): void {
     if ($missing) verify_response(false, 'invalid_request', 'Required verification values are missing.', null, ['missing' => $missing]);
 
     $wait = max(0, min(60, (int)$settings['wait_seconds']));
-    $poll = max(250, min(5000, (int)$settings['poll_interval_ms']));
+    $poll = max(150, min(3000, (int)$settings['poll_interval_ms']));
     $startedAt = microtime(true);
     $deadline = $startedAt + $wait;
     $lookupFailures = 0;
@@ -614,6 +710,11 @@ function api_verify(array $input): void {
             $candidates = array_values(array_filter($candidates, function ($candidate) use ($method) {
                 return strtolower((string)($candidate['record']['method'] ?? '')) === $method;
             }));
+        }
+        if (count($candidates) === 1 && empty($candidates[0]['etag'])) {
+            $fastMethod = strtolower((string)($candidates[0]['record']['method'] ?? ''));
+            $liveCandidate = query_candidate($fastMethod, $txnId, max(0.25, min(1.0, $lookupBudget)));
+            $candidates = $liveCandidate === null ? [] : [$liveCandidate];
         }
         if (count($candidates) > 1) verify_response(false, 'ambiguous', 'More than one transaction uses this Txn ID across payment methods. Supply the method or enable Payment method comparison.');
         if (count($candidates) === 1) {
@@ -646,6 +747,7 @@ function api_verify(array $input): void {
                 verify_response(false, 'conflict', 'Transaction changed during verification. Retry once.');
             }
             if ($write['code'] < 200 || $write['code'] >= 300) verify_response(false, 'service_unavailable', 'Payment matched but could not be reserved. Retry the request.');
+            mirror_database_write('PUT', $candidate['path'], $record);
             try { add_sharded_totals('reports/monthly/' . (string)($record['month'] ?? date('Y-m')), ['used_count' => 1], 1.0); } catch (Throwable $ignored) {}
             if (!empty($record['day'])) {
                 try { add_sharded_totals('reports/daily/' . (string)$record['day'], ['used_count' => 1], 1.0); } catch (Throwable $ignored) {}
@@ -660,6 +762,7 @@ function api_verify(array $input): void {
 
     $elapsed = max(0.0, microtime(true) - $startedAt);
     if ($lookupFailures > 0 && $successfulLookups === 0) {
+        try { add_api_metric('service_error', (string)($GLOBALS['PB_CURRENT_VERIFY_KEY_HASH'] ?? '')); } catch (Throwable $ignored) {}
         json_out(503, ['status'=>false, 'result'=>'service_unavailable', 'message'=>'Transaction lookup service is temporarily busy. Please retry.', 'retry_after_seconds'=>2, 'waited_seconds'=>round($elapsed,2)]);
     }
     try { add_lookup_attempt($txnId, 1, 0.15); } catch (Throwable $ignored) {}
@@ -668,6 +771,40 @@ function api_verify(array $input): void {
 function handle_api(): void {
     $route = current_route(); $method = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     if ($route === 'healthz' && $method === 'GET') json_out(200, ['ok' => true, 'service' => 'Payment Bridge Gateway', 'time' => time()]);
+    if ($route === 'api/app/latest' && $method === 'GET') {
+        try {
+            $release = fb_get('app_release/current');
+            if (!is_array($release) || empty($release['version_code'])) json_out(200, ['ok'=>true,'available'=>false,'version_code'=>0,'message'=>'No app update is published.']);
+            json_out(200, ['ok'=>true,'available'=>true,'version_code'=>(int)$release['version_code'],'version_name'=>(string)($release['version_name'] ?? ''),'release_notes'=>(string)($release['release_notes'] ?? ''),'min_supported_version'=>(int)($release['min_supported_version'] ?? 0),'download_url'=>'/api/app/apk']);
+        } catch (Throwable $e) { json_out(503, ['ok'=>false,'available'=>false,'message'=>'Update information is temporarily unavailable.']); }
+    }
+    if ($route === 'api/app/apk' && $method === 'GET') {
+        $downloadLock = @fopen(sys_get_temp_dir() . '/pb_apk_download.lock', 'c+');
+        if (!$downloadLock || !@flock($downloadLock, LOCK_EX | LOCK_NB)) {
+            if ($downloadLock) fclose($downloadLock);
+            json_out(503, ['ok'=>false,'message'=>'Another APK download is in progress. Retry shortly.','retry_after_seconds'=>5]);
+        }
+        try {
+            $release = fb_get('app_release/current');
+            $apkRecord = fb_get('app_release/apk/' . (int)($release['version_code'] ?? 0));
+            $encoded = (string)($apkRecord['apk_base64'] ?? '');
+            $apk = $encoded !== '' ? base64_decode($encoded, true) : false;
+            if (!is_string($apk) || strlen($apk) < 1000) {
+                @flock($downloadLock, LOCK_UN); @fclose($downloadLock);
+                json_out(404, ['ok'=>false,'message'=>'APK release not found.']);
+            }
+            header('Content-Type: application/vnd.android.package-archive');
+            header('Content-Disposition: attachment; filename="PaymentBridge-' . preg_replace('/[^A-Za-z0-9._-]/','',(string)($release['version_name'] ?? 'update')) . '.apk"');
+            header('Content-Length: ' . strlen($apk));
+            header('Cache-Control: private, max-age=300');
+            echo $apk;
+            @flock($downloadLock, LOCK_UN); @fclose($downloadLock);
+            exit;
+        } catch (Throwable $e) {
+            @flock($downloadLock, LOCK_UN); @fclose($downloadLock);
+            json_out(503, ['ok'=>false,'message'=>'APK download is temporarily unavailable.']);
+        }
+    }
     if ($route === 'api/health' && $method === 'GET') {
         if (!config_ready()) json_out(200, ['ok' => true, 'configured' => false, 'firebase' => false, 'service' => 'Payment Bridge Gateway', 'external_url' => envv('RENDER_EXTERNAL_URL'), 'message' => 'Backend environment is incomplete.', 'time' => time()]);
         try {
@@ -684,6 +821,9 @@ function handle_api(): void {
             if ($method === 'POST') api_verify(array_merge($_GET, request_json()));
             json_out(405, ['status' => false, 'result' => 'method_not_allowed', 'message' => 'Use GET or POST.']);
         } catch (Throwable $e) {
+            if (!empty($GLOBALS['PB_CURRENT_VERIFY_KEY_HASH'])) {
+                try { add_api_metric('service_error', (string)$GLOBALS['PB_CURRENT_VERIFY_KEY_HASH']); } catch (Throwable $ignored) {}
+            }
             json_out(503, ['status' => false, 'result' => 'service_error', 'message' => 'Verification temporarily unavailable.']);
         }
     }
@@ -736,8 +876,23 @@ function sum_shards_at(string $path): array {
 function period_shards(string $monthlyRoot, string $dailyRoot, string $period, string $month, int $year, int $start, int $end): array {
     $sum = [];
     $paths = [];
-    if ($period === '7d') {
-        for ($day = $start; $day <= $end; $day = strtotime('+1 day', $day)) $paths[] = [$dailyRoot, date('Y-m-d', $day)];
+    if (in_array($period, ['7d','day'], true)) {
+        for ($day = strtotime(date('Y-m-d 00:00:00', $start)); $day <= $end; $day = strtotime('+1 day', $day)) $paths[] = [$dailyRoot, date('Y-m-d', $day)];
+    } elseif ($period === 'range') {
+        $cursor = strtotime(date('Y-m-01 00:00:00', $start));
+        $endDay = strtotime(date('Y-m-d 00:00:00', $end));
+        $cursor = strtotime(date('Y-m-d 00:00:00', $start));
+        while ($cursor <= $endDay) {
+            $monthStart = strtotime(date('Y-m-01 00:00:00', $cursor));
+            $monthEnd = strtotime(date('Y-m-t 23:59:59', $cursor));
+            if ($cursor === $monthStart && $monthEnd <= $end) {
+                $paths[] = [$monthlyRoot, date('Y-m', $cursor)];
+                $cursor = strtotime('+1 day', strtotime(date('Y-m-t 00:00:00', $cursor)));
+            } else {
+                $paths[] = [$dailyRoot, date('Y-m-d', $cursor)];
+                $cursor = strtotime('+1 day', $cursor);
+            }
+        }
     } elseif ($period === 'year') {
         for ($m = 1; $m <= 12; $m++) $paths[] = [$monthlyRoot, sprintf('%04d-%02d', $year, $m)];
     } else $paths[] = [$monthlyRoot, $month];
@@ -748,6 +903,44 @@ function period_shards(string $monthlyRoot, string $dailyRoot, string $period, s
     return $sum;
 }
 function money(float $amount): string { return '৳' . number_format($amount, 2); }
+function run_data_cleanup(int $retentionDays = 365, int $perNodeLimit = 100): array {
+    $retentionDays = max(90, min(3650, $retentionDays));
+    $cutoff = time() - ($retentionDays * 86400);
+    $limits = max(1, min(250, $perNodeLimit));
+    $removed = ['sms_messages'=>0, 'duplicate_events'=>0];
+    foreach (['sms_messages'=>'created_at', 'duplicate_events'=>'created_at'] as $node=>$field) {
+        $rows = fb_query($node, ['orderBy'=>'"' . $field . '"', 'endAt'=>(string)$cutoff, 'limitToFirst'=>(string)$limits]);
+        if (!$rows) continue;
+        $patch = [];
+        foreach ($rows as $id=>$row) {
+            if (!preg_match('/^[A-Za-z0-9_-]{8,128}$/', (string)$id)) continue;
+            if (is_array($row) && (int)($row[$field] ?? 0) > 0 && (int)$row[$field] <= $cutoff) $patch[(string)$id] = null;
+        }
+        if ($patch) { fb_write('PATCH', $node, $patch); $removed[$node] = count($patch); }
+    }
+    return $removed;
+}
+function maybe_run_data_cleanup(): void {
+    $marker = sys_get_temp_dir() . '/pb_cleanup_last_run.json';
+    $lock = @fopen($marker . '.lock', 'c+');
+    if (!$lock || !@flock($lock, LOCK_EX | LOCK_NB)) { if ($lock) fclose($lock); return; }
+    try {
+        $last = 0;
+        if (is_file($marker)) { $data = json_decode((string)@file_get_contents($marker), true); $last = (int)($data['at'] ?? 0); }
+        if ($last > 0 && time() - $last < 86400) return;
+        $settings = fb_get('settings/maintenance');
+        if (array_key_exists('automatic_cleanup', $settings) && empty($settings['automatic_cleanup'])) return;
+        $days = max(90, min(3650, (int)($settings['cleanup_retention_days'] ?? 365)));
+        $result = run_data_cleanup($days, 250);
+        @file_put_contents($marker, json_encode(['at'=>time(),'removed'=>$result]), LOCK_EX);
+    } catch (Throwable $e) {
+        @file_put_contents($marker, json_encode(['at'=>time(),'error'=>true]), LOCK_EX);
+    } finally {
+        @flock($lock, LOCK_UN);
+        @fclose($lock);
+    }
+}
+
 function admin_page(): void {
     start_admin_session();
     $flash = (string)($_SESSION['flash'] ?? ''); $newAppKey = (string)($_SESSION['new_app_key'] ?? ''); $newVerifyKey = (string)($_SESSION['new_verify_key'] ?? '');
@@ -766,7 +959,35 @@ function admin_page(): void {
         }
         if (empty($_SESSION['admin']) || !hash_equals((string)$_SESSION['csrf'], (string)($_POST['csrf'] ?? ''))) { http_response_code(403); exit('Forbidden'); }
         try {
-            if ($action === 'create_app_key' || $action === 'create_verify_key') {
+            if ($action === 'publish_app_update') {
+                if (!isset($_FILES['apk']) || !is_array($_FILES['apk']) || (int)($_FILES['apk']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) throw new RuntimeException('Select a valid APK file and upload it again.');
+                $tmp = (string)($_FILES['apk']['tmp_name'] ?? ''); $size = (int)($_FILES['apk']['size'] ?? 0);
+                if (!is_uploaded_file($tmp) || $size < 1000 || $size > 12 * 1024 * 1024) throw new RuntimeException('APK must be a valid upload between 1 KB and 12 MB.');
+                $bytes = file_get_contents($tmp);
+                if (!is_string($bytes) || substr($bytes, 0, 4) !== "PK\x03\x04") throw new RuntimeException('Uploaded file does not look like an APK/ZIP package.');
+                $release = fb_get('app_release/current');
+                $versionCode = filter_var($_POST['version_code'] ?? null, FILTER_VALIDATE_INT);
+                if (!$versionCode || $versionCode < 1 || $versionCode <= (int)($release['version_code'] ?? 0)) throw new RuntimeException('Version Code must be greater than the currently published Version Code.');
+                $versionName = trim((string)($_POST['version_name'] ?? ''));
+                if ($versionName === '' || strlen($versionName) > 32) throw new RuntimeException('Version Name is required (maximum 32 characters).');
+                $notes = trim((string)($_POST['release_notes'] ?? ''));
+                if (strlen($notes) > 1200) throw new RuntimeException('Release notes are limited to 1,200 characters.');
+                $minSupported = max(0, (int)($_POST['min_supported_version'] ?? 0));
+                fb_write('PUT', 'app_release/apk/' . (int)$versionCode, ['apk_base64'=>base64_encode($bytes), 'sha256'=>hash('sha256',$bytes), 'size_bytes'=>$size]);
+                fb_write('PATCH', 'app_release/current', [
+                    'version_code'=>(int)$versionCode, 'version_name'=>$versionName,
+                    'release_notes'=>$notes, 'min_supported_version'=>$minSupported,
+                    'size_bytes'=>$size,
+                    'sha256'=>hash('sha256', $bytes), 'published_at'=>time(),
+                    'published_by'=>'admin'
+                ]);
+                $_SESSION['flash'] = 'App update published. Connected apps will detect Version Code ' . (int)$versionCode . '.';
+            } elseif ($action === 'run_cleanup') {
+                $retention = max(90, min(3650, (int)($_POST['retention_days'] ?? 365)));
+                $removed = run_data_cleanup($retention, 250);
+                fb_write('PATCH', 'settings/maintenance', ['automatic_cleanup'=>isset($_POST['automatic_cleanup']), 'cleanup_retention_days'=>$retention, 'cleanup_updated_at'=>time()]);
+                $_SESSION['flash'] = 'Cleanup done: ' . $removed['sms_messages'] . ' old SMS rows and ' . $removed['duplicate_events'] . ' duplicate event rows removed. Payment transaction history was kept.';
+            } elseif ($action === 'create_app_key' || $action === 'create_verify_key') {
                 $isApp = $action === 'create_app_key';
                 $prefix = $isApp ? 'PBU-' : 'PBV-';
                 $rawKey = $prefix . strtoupper(bin2hex(random_bytes(24)));
@@ -775,7 +996,7 @@ function admin_page(): void {
                 $record = ['active' => true, 'label' => u_substr(trim((string)($_POST['label'] ?? '')), 0, 80), 'key_hint' => substr($rawKey, 0, 9) . '…' . substr($rawKey, -6), 'created_at' => time(), 'last_used_at' => 0, 'usage_count' => 0, 'multi_device' => true];
                 if (!$isApp) {
                     $record['wait_seconds'] = max(0, min(60, (int)($_POST['wait_seconds'] ?? 10)));
-                    $record['poll_interval_ms'] = max(250, min(5000, (int)($_POST['poll_interval_ms'] ?? 1000)));
+                    $record['poll_interval_ms'] = max(150, min(3000, (int)($_POST['poll_interval_ms'] ?? 250)));
                     $record['rate_limit_per_min'] = max(10, min(300, (int)($_POST['rate_limit_per_min'] ?? 120)));
                 }
                 $record = array_merge($record, encrypt_admin_key($rawKey));
@@ -790,7 +1011,7 @@ function admin_page(): void {
                 if (empty($existing['active'])) throw new RuntimeException('Verification API key is inactive.');
                 fb_write('PATCH', $path, [
                     'wait_seconds' => max(0, min(60, (int)($_POST['wait_seconds'] ?? 10))),
-                    'poll_interval_ms' => max(250, min(5000, (int)($_POST['poll_interval_ms'] ?? 1000))),
+                    'poll_interval_ms' => max(150, min(3000, (int)($_POST['poll_interval_ms'] ?? 250))),
                     'rate_limit_per_min' => max(10, min(300, (int)($_POST['rate_limit_per_min'] ?? 120))),
                     'timing_updated_at' => time()
                 ]);
@@ -823,7 +1044,7 @@ function admin_page(): void {
                 $checks = ['verify_number' => isset($_POST['verify_number']), 'verify_amount' => isset($_POST['verify_amount']), 'verify_txn_id' => isset($_POST['verify_txn_id']), 'verify_method' => isset($_POST['verify_method'])];
                 fb_write('PATCH', 'settings/verification', array_merge($checks, [
                     'wait_seconds' => max(0, min(60, (int)($_POST['wait_seconds'] ?? 10))),
-                    'poll_interval_ms' => max(250, min(5000, (int)($_POST['poll_interval_ms'] ?? 1000)))
+                    'poll_interval_ms' => max(150, min(3000, (int)($_POST['poll_interval_ms'] ?? 250)))
                 ]));
                 $_SESSION['flash'] = 'Verification settings saved.';
             } elseif ($action === 'status_update') {
@@ -861,14 +1082,28 @@ function admin_page(): void {
         return;
     }
 
+    if (config_ready()) maybe_run_data_cleanup();
     $month = (string)($_GET['month'] ?? date('Y-m')); [$month, $monthStart, $monthEnd] = month_range($month);
     $period = (string)($_GET['period'] ?? 'month');
-    if (!in_array($period, ['7d','month','year'], true)) $period = 'month';
+    if (!in_array($period, ['7d','day','range','month','year'], true)) $period = 'month';
     $reportYear = max(2020, min((int)date('Y') + 1, (int)($_GET['year'] ?? date('Y'))));
+    $reportDate = (string)($_GET['date'] ?? date('Y-m-d'));
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $reportDate) || !strtotime($reportDate)) $reportDate = date('Y-m-d');
+    $rangeFrom = (string)($_GET['from'] ?? date('Y-m-01'));
+    $rangeTo = (string)($_GET['to'] ?? date('Y-m-d'));
+    foreach (['rangeFrom','rangeTo'] as $rangeVar) { if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $$rangeVar) || !strtotime($$rangeVar)) $$rangeVar = date('Y-m-d'); }
     if ($period === '7d') {
         $periodEnd = strtotime(date('Y-m-d 23:59:59'));
         $periodStart = strtotime('-6 days', strtotime(date('Y-m-d 00:00:00')));
         $periodLabel = date('d M', $periodStart) . ' – ' . date('d M Y', $periodEnd);
+    } elseif ($period === 'day') {
+        $periodStart = strtotime($reportDate . ' 00:00:00'); $periodEnd = strtotime($reportDate . ' 23:59:59');
+        $periodLabel = date('d M Y', $periodStart);
+    } elseif ($period === 'range') {
+        $fromTs = strtotime($rangeFrom . ' 00:00:00'); $toTs = strtotime($rangeTo . ' 23:59:59');
+        if ($fromTs > $toTs) { [$rangeFrom,$rangeTo] = [$rangeTo,$rangeFrom]; $fromTs = strtotime($rangeFrom . ' 00:00:00'); $toTs = strtotime($rangeTo . ' 23:59:59'); }
+        if (($toTs - $fromTs) > 92 * 86400) { $toTs = $fromTs + 92 * 86400 - 1; $rangeTo = date('Y-m-d', $toTs); }
+        $periodStart = $fromTs; $periodEnd = $toTs; $periodLabel = $rangeFrom . ' – ' . $rangeTo;
     } elseif ($period === 'year') {
         $periodStart = strtotime(sprintf('%04d-01-01 00:00:00', $reportYear));
         $periodEnd = strtotime(sprintf('%04d-12-31 23:59:59', $reportYear));
@@ -877,27 +1112,36 @@ function admin_page(): void {
         $periodStart = $monthStart; $periodEnd = $monthEnd; $periodLabel = $month;
     }
     $tab = (string)($_GET['tab'] ?? 'overview');
-    $allowedTabs = ['overview','transactions','unverified','duplicates','sms','api','devices','data','settings'];
+    $allowedTabs = ['overview','transactions','unverified','duplicates','sms','api','monitor','sim','devices','data','updates','settings'];
     if (!in_array($tab, $allowedTabs, true)) $tab = 'overview';
     $appKeys = $verifyKeys = $devices = $transactions = $smsRows = $duplicateRows = $apiMetrics = $reportTotals = $firebaseDataView = $simRegistry = [];
+    $publishedRelease = []; 
     $dataNode = strtolower((string)($_GET['node'] ?? 'verification'));
     if (!in_array($dataNode, ['verification','devices','app_keys','api_keys','monthly_report','monthly_api'], true)) $dataNode = 'verification';
-    $verification = ['verify_number' => false, 'verify_amount' => true, 'verify_txn_id' => true, 'verify_method' => true, 'wait_seconds' => 10, 'poll_interval_ms' => 1000];
+    $verification = ['verify_number' => false, 'verify_amount' => true, 'verify_txn_id' => true, 'verify_method' => true, 'wait_seconds' => 10, 'poll_interval_ms' => 250];
     $loadError = '';
     if (config_ready()) {
         try {
-            $appKeys = fb_get('settings/app_upload_keys');
-            $verifyKeys = fb_get('settings/verification_api_keys');
-            $devices = fb_get('devices');
-            $verification = array_merge($verification, fb_get('settings/verification'));
-            $transactions = range_transactions($periodStart, $periodEnd, 20000);
-            $smsRows = fb_query('sms_messages', ['orderBy' => '"created_at"', 'startAt' => (string)$periodStart, 'endAt' => (string)$periodEnd, 'limitToLast' => '2000']);
-            $duplicateRows = fb_query('duplicate_events', ['orderBy' => '"created_at"', 'startAt' => (string)$periodStart, 'endAt' => (string)$periodEnd, 'limitToLast' => '2000']);
-            $apiMetrics = period_shards('metrics/api_monthly', 'metrics/api_daily', $period, $month, $reportYear, $periodStart, $periodEnd);
-            $reportTotals = period_shards('reports/monthly', 'reports/daily', $period, $month, $reportYear, $periodStart, $periodEnd);
-            $simRegistry = fb_get('reports/sim_registry');
-            $dataPaths = ['verification'=>'settings/verification','devices'=>'devices','app_keys'=>'settings/app_upload_keys','api_keys'=>'settings/verification_api_keys','monthly_report'=>'reports/monthly/' . $month . '/shards','monthly_api'=>'metrics/api_monthly/' . $month . '/shards'];
-            $firebaseDataView = fb_get($dataPaths[$dataNode]);
+            $needKeys = in_array($tab, ['overview','api','monitor'], true);
+            $needDevices = in_array($tab, ['overview','devices','monitor'], true);
+            $needTransactions = in_array($tab, ['overview','transactions','unverified'], true) || (isset($_GET['export']) && $_GET['export'] === 'transactions');
+            $needSim = in_array($tab, ['overview','sim','transactions','unverified'], true);
+            $needMetrics = in_array($tab, ['overview','api','monitor'], true);
+            $needReports = in_array($tab, ['overview','sim'], true);
+            if ($needKeys) { $appKeys = fb_get('settings/app_upload_keys'); $verifyKeys = fb_get('settings/verification_api_keys'); }
+            if ($needDevices) $devices = fb_get('devices');
+            if ($tab === 'settings') $verification = array_merge($verification, fb_get('settings/verification'));
+            if ($needTransactions) $transactions = range_transactions($periodStart, $periodEnd, $tab === 'overview' ? 100 : 20000);
+            if ($tab === 'sms') $smsRows = fb_query('sms_messages', ['orderBy' => '"created_at"', 'startAt' => (string)$periodStart, 'endAt' => (string)$periodEnd, 'limitToLast' => '500']);
+            if ($tab === 'duplicates') $duplicateRows = fb_query('duplicate_events', ['orderBy' => '"created_at"', 'startAt' => (string)$periodStart, 'endAt' => (string)$periodEnd, 'limitToLast' => '500']);
+            if ($needMetrics) $apiMetrics = period_shards('metrics/api_monthly', 'metrics/api_daily', $period, $month, $reportYear, $periodStart, $periodEnd);
+            if ($needReports) $reportTotals = period_shards('reports/monthly', 'reports/daily', $period, $month, $reportYear, $periodStart, $periodEnd);
+            if ($needSim) $simRegistry = fb_get('reports/sim_registry');
+            if ($tab === 'data') {
+                $dataPaths = ['verification'=>'settings/verification','devices'=>'devices','app_keys'=>'settings/app_upload_keys','api_keys'=>'settings/verification_api_keys','monthly_report'=>'reports/monthly/' . $month . '/shards','monthly_api'=>'metrics/api_monthly/' . $month . '/shards'];
+                $firebaseDataView = fb_get($dataPaths[$dataNode]);
+            }
+            if ($tab === 'updates') $publishedRelease = fb_get('app_release/current');
             uasort($transactions, function ($a, $b) { return (int)($b['created_at'] ?? 0) <=> (int)($a['created_at'] ?? 0); });
             uasort($smsRows, function ($a, $b) { return (int)($b['created_at'] ?? 0) <=> (int)($a['created_at'] ?? 0); });
         } catch (Throwable $e) { $loadError = $e->getMessage(); }
@@ -916,7 +1160,7 @@ function admin_page(): void {
     $smsCount = (int)($reportTotals['sms_count'] ?? 0);
     if ($smsCount === 0 && count($smsRows) > 0) $smsCount = count($smsRows);
     $duplicateTxnCount = (int)($reportTotals['duplicate_txn_count'] ?? 0);
-    if (count($transactions) > 0 && count($transactions) < 20000) {
+    if (in_array($tab, ['transactions','unverified'], true) && count($transactions) > 0 && count($transactions) < 20000) {
         $incoming = 0.0; $outgoing = 0.0; $incomingCount = 0; $outgoingCount = 0; $paymentCount = count($transactions);
         foreach ($transactions as $tx) if (is_array($tx)) {
             $direction = strtolower((string)($tx['direction'] ?? ''));
@@ -996,6 +1240,13 @@ function admin_page(): void {
     $apiRequests = (int)($apiMetrics['requests'] ?? 0);
     $apiSuccess = (int)($apiMetrics['result_success'] ?? 0);
     $search = u_lower(trim((string)($_GET['q'] ?? ''))); $methodFilter = strtolower(trim((string)($_GET['method'] ?? ''))); $statusFilter = strtolower(trim((string)($_GET['status'] ?? ''))); $typeFilter = strtolower(trim((string)($_GET['type'] ?? ''))); $directionFilter = strtolower(trim((string)($_GET['direction'] ?? ''))); $simFilter = strtolower(trim((string)($_GET['sim'] ?? '')));
+    $numberFilter = normalize_number((string)($_GET['number'] ?? ''));
+    $txnFilter = strtoupper(trim((string)($_GET['txn_id'] ?? '')));
+    $amountFilterRaw = trim((string)($_GET['amount'] ?? ''));
+    $amountFilter = $amountFilterRaw !== '' && is_numeric($amountFilterRaw) ? (float)$amountFilterRaw : null;
+    $dateFromFilter = (string)($_GET['date_from'] ?? ''); $dateToFilter = (string)($_GET['date_to'] ?? '');
+    $dateFromTs = preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateFromFilter) ? strtotime($dateFromFilter . ' 00:00:00') : null;
+    $dateToTs = preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateToFilter) ? strtotime($dateToFilter . ' 23:59:59') : null;
     $filtered = [];
     foreach (($tab === 'unverified' ? $unverified : $transactions) as $k => $tx) {
         if (!is_array($tx)) continue;
@@ -1004,13 +1255,40 @@ function admin_page(): void {
         if ($typeFilter !== '' && strtolower((string)($tx['transaction_type'] ?? '')) !== $typeFilter) continue;
         if ($directionFilter !== '' && strtolower((string)($tx['direction'] ?? '')) !== $directionFilter) continue;
         if ($simFilter !== '' && strtolower((string)($tx['sim_key'] ?? 'legacy-unknown')) !== $simFilter) continue;
+        if ($txnFilter !== '' && strpos(strtoupper((string)($tx['txn_id'] ?? '')), $txnFilter) === false) continue;
+        if ($numberFilter !== '' && strpos(normalize_number((string)($tx['sender'] ?? '') . ' ' . (string)($tx['sim_number'] ?? '')), $numberFilter) === false) continue;
+        if ($amountFilter !== null && abs((float)($tx['amount'] ?? -999999) - $amountFilter) >= 0.005) continue;
+        $created = (int)($tx['created_at'] ?? 0);
+        if ($dateFromTs !== null && $created < $dateFromTs) continue;
+        if ($dateToTs !== null && $created > $dateToTs) continue;
         $hay = u_lower(implode(' ', [(string)($tx['txn_id'] ?? ''),(string)($tx['sender'] ?? ''),(string)($tx['method'] ?? ''),(string)($tx['sim_number'] ?? ''),(string)($tx['sim_carrier'] ?? '')]));
         if ($search !== '' && strpos($hay, $search) === false) continue;
         $filtered[$k] = $tx;
     }
     $filtered = array_slice($filtered, 0, 250, true);
+    $simSearchRaw = trim((string)($_GET['simq'] ?? ''));
+    $simSearchDigits = normalize_number($simSearchRaw);
+    if ($simSearchRaw !== '') {
+        $simSummary = array_filter($simSummary, function($sim) use ($simSearchRaw,$simSearchDigits) {
+            $number = normalize_number((string)($sim['number'] ?? ''));
+            $hay = u_lower(implode(' ', [(string)($sim['label'] ?? ''),(string)($sim['carrier'] ?? ''),(string)($sim['slot'] ?? '')]));
+            return ($simSearchDigits !== '' && $number !== '' && strpos($number, $simSearchDigits) !== false) || strpos($hay, u_lower($simSearchRaw)) !== false;
+        });
+    }
+    $simSearchNumberFound = false;
+    foreach ($simSummary as $simItem) if ($simSearchRaw !== '' && $simSearchDigits !== '' && strpos(normalize_number((string)($simItem['number'] ?? '')), $simSearchDigits) !== false) $simSearchNumberFound = true;
+    $apiKeyStats = [];
+    foreach ($verifyKeys as $keyHash=>$keyRecord) if (is_array($keyRecord)) {
+        $prefix = 'key_' . substr((string)$keyHash,0,24) . '_';
+        $requests = (int)($apiMetrics[$prefix . 'requests'] ?? 0);
+        if ($requests === 0 && !isset($apiMetrics[$prefix . 'result_success'])) continue;
+        $success = (int)($apiMetrics[$prefix . 'result_success'] ?? 0);
+        $apiKeyStats[$keyHash] = ['label'=>(string)($keyRecord['label'] ?? $keyRecord['key_hint'] ?? 'API key'), 'hint'=>(string)($keyRecord['key_hint'] ?? ''), 'requests'=>$requests, 'success'=>$success, 'failure'=>max(0,$requests-$success), 'rate'=>$requests>0?round(100*$success/$requests,1):0.0];
+    }
+    $apiFailure = max(0, $apiRequests - $apiSuccess);
+    $apiSuccessRate = $apiRequests > 0 ? round(100*$apiSuccess/$apiRequests,1) : 0.0;
     $csrf = (string)$_SESSION['csrf'];
-    $tabs = ['overview'=>'Overview','transactions'=>'Transactions','unverified'=>'Not API-checked','sms'=>'Payment SMS','api'=>'API & Keys','devices'=>'Devices','duplicates'=>'Duplicates','data'=>'Firebase Data','settings'=>'Settings'];
+    $tabs = ['overview'=>'Overview','sim'=>'SIM Analytics','transactions'=>'Advanced Search','unverified'=>'Not API-checked','monitor'=>'Live API Monitor','sms'=>'Payment SMS','api'=>'API & Keys','devices'=>'Device Monitor','duplicates'=>'Duplicates','data'=>'Firebase Data','updates'=>'App Updates','settings'=>'Settings'];
     $renderExternalUrl = rtrim(envv('RENDER_EXTERNAL_URL'), '/');
     $badge = function ($value, $good = true) { return '<span class="badge ' . ($good ? 'good' : 'bad') . '">' . h((string)$value) . '</span>'; };
     $devicesNeedAttention = 0; $pendingQueueTotal = 0;
@@ -1024,34 +1302,41 @@ function admin_page(): void {
     }
     ?><!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#080f1c"><title>Payment Bridge · Gateway</title><style>
     :root{color-scheme:dark;--bg:#070d18;--side:#0b1423;--panel:#101d30;--panel2:#14243a;--line:#263a55;--text:#edf5ff;--muted:#91a4bf;--mint:#2bd5a1;--blue:#5792ff;--amber:#f1bd62;--red:#fa7180;--shadow:0 18px 46px #0005}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% -10%,#183153 0,transparent 35%),var(--bg);color:var(--text);font:14px Inter,system-ui,Arial}.shell{display:grid;grid-template-columns:238px minmax(0,1fr);min-height:100vh}.side{background:#091321;border-right:1px solid var(--line);padding:23px 14px;position:sticky;top:0;height:100vh}.brand{display:flex;align-items:center;gap:11px;padding:4px 9px 25px}.logo{width:39px;height:39px;border-radius:13px;background:linear-gradient(135deg,#27d5a0,#168fbd);display:grid;place-items:center;color:#03251b;font-weight:1000;font-size:17px}.brand strong{display:block;font-size:15px;letter-spacing:.5px}.brand small{color:var(--muted);font-size:10px;letter-spacing:1.6px}.nav a{display:flex;gap:11px;align-items:center;padding:12px 13px;color:#a9bad0;text-decoration:none;border-radius:11px;margin:4px 0;font-weight:650}.nav a.active,.nav a:hover{background:#142840;color:#eaf5ff}.nav .ico{width:20px;text-align:center;color:var(--mint)}.sidebottom{position:absolute;bottom:20px;left:14px;right:14px;color:var(--muted);font-size:11px;border-top:1px solid var(--line);padding:15px 8px}.main{min-width:0;padding:24px clamp(14px,3vw,38px) 60px;max-width:1600px;width:100%;margin:auto}.top{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:22px}.eyebrow{color:var(--mint);font-size:10px;letter-spacing:2px;font-weight:800}.top h1{font-size:26px;margin:4px 0}.sub{color:var(--muted);font-size:12px}.topright{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;padding:5px 9px;border-radius:30px;font-size:10px;font-weight:850;letter-spacing:.5px;background:#203047;color:#c6d7ec}.badge.good{background:#103b32;color:#6ce7c1}.badge.bad{background:#48242d;color:#ffadb6}.badge.warn{background:#45351e;color:#ffd78c}.panel{background:linear-gradient(180deg,#122139,#0e1a2c);border:1px solid var(--line);border-radius:17px;box-shadow:var(--shadow);padding:18px;margin-bottom:16px}.panelhead{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:15px}.panel h2{font-size:15px;margin:0}.panel p{color:var(--muted);font-size:12px;line-height:1.6}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin-bottom:16px}.stat{background:linear-gradient(145deg,#142640,#0e1b2d);border:1px solid var(--line);padding:17px;border-radius:15px;min-width:0}.stat .label{color:var(--muted);font-size:11px}.stat .value{font-weight:850;font-size:clamp(18px,2.1vw,25px);margin:8px 0 4px;overflow-wrap:anywhere}.stat .hint{font-size:10px;color:var(--muted)}.mint{color:var(--mint)}.blue{color:#88b5ff}.amber{color:var(--amber)}.red{color:var(--red)}.row{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.row form{margin:0}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}label{display:block;color:#a9bad0;font-size:11px;margin:9px 0 5px}input,select,button,.btn{font:inherit;border:1px solid #304663;border-radius:10px;padding:10px 11px;background:#0a1627;color:var(--text);width:100%;min-width:0}input[type=checkbox]{width:auto;accent-color:var(--mint);margin-right:7px}button,.btn{background:linear-gradient(135deg,#25c99a,#159b88);color:#03251d;border:0;font-weight:850;cursor:pointer;text-decoration:none;text-align:center;display:inline-block}button.secondary,.btn.secondary{background:#263b57;color:#e6f1ff}button.danger{background:#7c2f3d;color:#fff}button.small{width:auto;padding:7px 10px;font-size:11px}.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:720px;font-size:12px}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #24364e;white-space:nowrap}.message-cell{white-space:normal;min-width:260px;max-width:460px;overflow-wrap:anywhere;word-break:break-word;line-height:1.5}.message-cell summary{cursor:pointer;white-space:normal;overflow-wrap:anywhere;max-width:430px}.full-message{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;max-width:460px;padding:9px;margin-top:7px;border:1px solid var(--line);border-radius:8px;background:#081526}.wrap-cell{white-space:normal;overflow-wrap:anywhere;word-break:break-word;max-width:220px}.sub{overflow-wrap:anywhere}th{background:#14243a;color:#9db1ca;font-size:10px;text-transform:uppercase;letter-spacing:.7px}tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.keybox{font:800 14px ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-word;background:#071321;border:1px dashed #318f79;padding:13px;border-radius:10px;margin:10px 0}.notice{overflow-wrap:anywhere;word-break:break-word;border:1px solid #267d68;background:#0d302b;color:#b8ffe9;padding:13px;border-radius:12px;margin-bottom:15px}.warning{border-color:#735629;background:#332817;color:#ffe2a9}.sectionnote{font-size:11px;color:var(--muted);line-height:1.6}.barrow{display:grid;grid-template-columns:78px 1fr 90px;gap:10px;align-items:center;margin:10px 0;font-size:11px;color:var(--muted)}.bar{height:8px;background:#1b2b42;border-radius:10px;overflow:hidden}.bar i{height:100%;display:block;background:linear-gradient(90deg,#21bd9a,#5f9dff);border-radius:10px}.filter{display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:9px;align-items:end;margin-bottom:14px}.inlineform{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.inlineform select{width:auto;min-width:110px}.inlineform button{width:auto}.checkgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.checkitem{padding:12px;border:1px solid var(--line);border-radius:11px;background:#0b1728}.checkitem label{margin:0;color:var(--text);font-size:12px}.topmobile{display:none}.empty{padding:27px;text-align:center;color:var(--muted)}@media(max-width:1000px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.shell{grid-template-columns:205px minmax(0,1fr)}}@media(max-width:720px){.shell{display:block}.side{position:relative;width:auto;height:auto;padding:10px;border-right:0;border-bottom:1px solid var(--line)}.brand{padding:5px 8px 12px}.nav{display:flex;overflow:auto;gap:4px;padding-bottom:3px}.nav a{white-space:nowrap;margin:0;padding:10px;font-size:11px}.sidebottom{display:none}.main{padding-top:18px}.top{align-items:flex-start;flex-direction:column}.stats{gap:8px}.stat{padding:13px}.grid2,.grid3{grid-template-columns:1fr}.filter{grid-template-columns:1fr 1fr}.filter .wide{grid-column:1/-1}.checkgrid{grid-template-columns:1fr}}@media(max-width:390px){.stats{grid-template-columns:1fr 1fr}.stat .value{font-size:18px}}
-    </style></head><body><div class="shell"><aside class="side"><div class="brand"><div class="logo">PB</div><div><strong>PAYMENT BRIDGE</strong><small>PERSONAL GATEWAY</small></div></div><nav class="nav"><?php foreach ($tabs as $id=>$label): $icons=['overview'=>'◫','transactions'=>'▤','unverified'=>'◷','duplicates'=>'≋','sms'=>'▣','api'=>'⌘','devices'=>'▦','data'=>'◈','settings'=>'⚙']; ?><a class="<?= $tab===$id?'active':'' ?>" href="/admin?tab=<?=h($id)?>&amp;month=<?=h($month)?>&amp;period=<?=h($period)?>&amp;year=<?=h((string)$reportYear)?>"><span class="ico"><?=$icons[$id]?></span><?=h($label)?></a><?php endforeach; ?></nav><div class="sidebottom">Firebase Realtime Database<br>Single database · No SQL</div></aside><main class="main"><header class="top"><div><div class="eyebrow">PAYMENT OPERATIONS / BD</div><h1><?=h($tabs[$tab])?></h1><div class="sub">Selected period: <?=h($periodLabel)?> · Asia/Dhaka<?php if($renderExternalUrl!==''): ?> · Service URL: <?=h($renderExternalUrl)?><?php endif; ?></div></div><div class="topright"><a class="btn secondary small" href="/api/health" target="_blank" rel="noopener">API HEALTH</a><?=$badge(config_ready()?'BACKEND READY':'CONFIG REQUIRED',config_ready())?><form method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><button class="secondary small">Sign out</button></form></div></header>
+    </style></head><body><div class="shell"><aside class="side"><div class="brand"><div class="logo">PB</div><div><strong>PAYMENT BRIDGE</strong><small>PERSONAL GATEWAY</small></div></div><nav class="nav"><?php foreach ($tabs as $id=>$label): $icons=['overview'=>'◫','sim'=>'▤','transactions'=>'⌕','unverified'=>'◷','monitor'=>'⌁','duplicates'=>'≋','sms'=>'▣','api'=>'⌘','devices'=>'▦','data'=>'◈','updates'=>'⇧','settings'=>'⚙']; ?><a class="<?= $tab===$id?'active':'' ?>" href="/admin?tab=<?=h($id)?>&amp;month=<?=h($month)?>&amp;period=<?=h($period)?>&amp;year=<?=h((string)$reportYear)?>"><span class="ico"><?=$icons[$id]?></span><?=h($label)?></a><?php endforeach; ?></nav><div class="sidebottom">Firebase RTDB<br>Primary + optional mirror</div></aside><main class="main"><header class="top"><div><div class="eyebrow">PAYMENT OPERATIONS / BD</div><h1><?=h($tabs[$tab])?></h1><div class="sub">Selected period: <?=h($periodLabel)?> · Asia/Dhaka<?php if($renderExternalUrl!==''): ?> · Service URL: <?=h($renderExternalUrl)?><?php endif; ?></div></div><div class="topright"><a class="btn secondary small" href="/api/health" target="_blank" rel="noopener">API HEALTH</a><?=$badge(config_ready()?'BACKEND READY':'CONFIG REQUIRED',config_ready())?><form method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><button class="secondary small">Sign out</button></form></div></header>
     <?php if ($flash !== ''): ?><div class="notice"><?=h($flash)?></div><?php endif; ?>
     <?php if ($newAppKey !== ''): ?><div class="notice"><b>New App Upload Key — copy now</b><div class="keybox" id="freshappkey"><?=h($newAppKey)?></div><button class="small" onclick="navigator.clipboard.writeText(document.getElementById('freshappkey').innerText)">Copy key</button><p>One key may be entered on many phones. The full key is shown once.</p></div><?php endif; ?>
     <?php if ($newVerifyKey !== ''): ?><div class="notice"><b>New Verification API Key — copy now</b><div class="keybox" id="freshverifykey"><?=h($newVerifyKey)?></div><button class="small" onclick="navigator.clipboard.writeText(document.getElementById('freshverifykey').innerText)">Copy key</button><p>Use this key from server-side website code or Telegram bot. Never expose it in public JavaScript.</p></div><?php endif; ?>
     <?php if ($loadError !== ''): ?><div class="notice warning"><?=h($loadError)?></div><?php endif; ?>
-    <form method="get" class="row" style="margin:0 0 16px"><input type="hidden" name="tab" value="<?=h($tab)?>"><label style="margin:0">Report period</label><select name="period" style="max-width:145px"><option value="7d" <?=$period==='7d'?'selected':''?>>Last 7 days</option><option value="month" <?=$period==='month'?'selected':''?>>Month</option><option value="year" <?=$period==='year'?'selected':''?>>Year</option></select><input type="month" name="month" value="<?=h($month)?>" style="max-width:160px"><input type="number" name="year" min="2020" max="<?=date('Y')+1?>" value="<?=h((string)$reportYear)?>" style="max-width:110px"><button class="small">Apply</button><a class="btn secondary small" href="/admin?tab=transactions&amp;period=<?=h($period)?>&amp;month=<?=h($month)?>&amp;year=<?=h((string)$reportYear)?>&amp;export=transactions">Export CSV</a></form>
+    <form method="get" class="row" style="margin:0 0 16px"><input type="hidden" name="tab" value="<?=h($tab)?>"><label style="margin:0">Report period</label><select name="period" style="max-width:145px"><option value="day" <?=$period==='day'?'selected':''?>>Single day</option><option value="7d" <?=$period==='7d'?'selected':''?>>Last 7 days</option><option value="range" <?=$period==='range'?'selected':''?>>Date range</option><option value="month" <?=$period==='month'?'selected':''?>>Month</option><option value="year" <?=$period==='year'?'selected':''?>>Year</option></select><input type="date" name="date" value="<?=h($reportDate)?>" style="max-width:150px"><input type="date" name="from" value="<?=h($rangeFrom)?>" style="max-width:150px"><input type="date" name="to" value="<?=h($rangeTo)?>" style="max-width:150px"><input type="month" name="month" value="<?=h($month)?>" style="max-width:150px"><input type="number" name="year" min="2020" max="<?=date('Y')+1?>" value="<?=h((string)$reportYear)?>" style="max-width:90px"><button class="small">Apply</button><a class="btn secondary small" href="/admin?tab=transactions&amp;period=<?=h($period)?>&amp;month=<?=h($month)?>&amp;year=<?=h((string)$reportYear)?>&amp;export=transactions">Export CSV</a></form>
     <?php if ($tab === 'overview'): ?>
-      <div class="stats"><div class="stat"><div class="label">MONEY RECEIVED · CREDIT</div><div class="value mint"><?=h(money($incoming))?></div><div class="hint"><?=number_format($incomingCount)?> incoming transactions</div></div><div class="stat"><div class="label">MONEY SENT · DEBIT</div><div class="value amber"><?=h(money($outgoing))?></div><div class="hint"><?=number_format($outgoingCount)?> outgoing transactions</div></div><div class="stat"><div class="label">PAYMENT TXN IDS</div><div class="value blue"><?=number_format($paymentCount)?></div><div class="hint">Unique Method + Txn ID records</div></div><div class="stat"><div class="label">NOT API-CHECKED</div><div class="value red"><?=number_format(count($unverified))?></div><div class="hint">Payment SMS with no matched API attempt</div></div><div class="stat"><div class="label">API VERIFY REQUESTS</div><div class="value"><?=number_format($apiRequests)?></div><div class="hint"><?=number_format($apiSuccess)?> successful in selected period</div></div><div class="stat"><div class="label">USED / VERIFIED PAYMENTS</div><div class="value mint"><?=number_format($usedCount)?></div><div class="hint">Transactions marked used</div></div><div class="stat"><div class="label">PAYMENT SMS</div><div class="value"><?=number_format($smsCount)?></div><div class="hint">Payment notifications saved</div></div><div class="stat"><div class="label">DUPLICATE TXN</div><div class="value amber"><?=number_format($duplicateTxnCount)?></div><div class="hint">Repeated Method + Txn ID uploads</div></div><div class="stat"><div class="label">APP INSTANCES</div><div class="value"><?=number_format(count($devices))?></div><div class="hint">Installations seen by backend</div></div><div class="stat"><div class="label">API KEYS</div><div class="value"><?=number_format(count(array_filter($verifyKeys, function($v){return is_array($v)&&!empty($v['active']);})))?></div><div class="hint">Active verification keys</div></div></div>
+      <div class="stats"><div class="stat"><div class="label">MONEY RECEIVED · CREDIT</div><div class="value mint"><?=h(money($incoming))?></div><div class="hint"><?=number_format($incomingCount)?> incoming transactions</div></div><div class="stat"><div class="label">MONEY SENT · DEBIT</div><div class="value amber"><?=h(money($outgoing))?></div><div class="hint"><?=number_format($outgoingCount)?> outgoing transactions</div></div><div class="stat"><div class="label">PAYMENT TXN IDS</div><div class="value blue"><?=number_format($paymentCount)?></div><div class="hint">Unique Method + Txn ID records</div></div><div class="stat"><div class="label">RECENT NOT API-CHECKED</div><div class="value red"><?=number_format(count($unverified))?></div><div class="hint">Latest 100 payment records only</div></div><div class="stat"><div class="label">API VERIFY REQUESTS</div><div class="value"><?=number_format($apiRequests)?></div><div class="hint"><?=number_format($apiSuccess)?> successful in selected period</div></div><div class="stat"><div class="label">USED / VERIFIED PAYMENTS</div><div class="value mint"><?=number_format($usedCount)?></div><div class="hint">Transactions marked used</div></div><div class="stat"><div class="label">PAYMENT SMS</div><div class="value"><?=number_format($smsCount)?></div><div class="hint">Payment notifications saved</div></div><div class="stat"><div class="label">DUPLICATE TXN</div><div class="value amber"><?=number_format($duplicateTxnCount)?></div><div class="hint">Repeated Method + Txn ID uploads</div></div><div class="stat"><div class="label">APP INSTANCES</div><div class="value"><?=number_format(count($devices))?></div><div class="hint">Installations seen by backend</div></div><div class="stat"><div class="label">API KEYS</div><div class="value"><?=number_format(count(array_filter($verifyKeys, function($v){return is_array($v)&&!empty($v['active']);})))?></div><div class="hint">Active verification keys</div></div></div>
       <div class="grid2"><section class="panel"><div class="panelhead"><h2>Money flow</h2><span class="badge good"><?=h($periodLabel)?></span></div><div class="barrow"><span>Received</span><div class="bar"><i style="width:<?=($incoming+$outgoing)>0?max(2,min(100,100*$incoming/($incoming+$outgoing))):0?>%"></i></div><b><?=h(money($incoming))?></b></div><div class="barrow"><span>Sent</span><div class="bar"><i style="width:<?=($incoming+$outgoing)>0?max(2,min(100,100*$outgoing/($incoming+$outgoing))):0?>%;background:linear-gradient(90deg,#e8ac50,#e46d75)"></i></div><b><?=h(money($outgoing))?></b></div><p>Incoming is counted from SMS parsed as <b>credit</b>; outgoing is counted from <b>debit</b>. Unknown direction is not included in money-flow totals.</p></section><section class="panel"><div class="panelhead"><h2>Payment follow-up</h2><span class="badge warn">Action needed</span></div><p><b class="red"><?=count($unverified)?></b> payments have arrived but no verification request has been matched to their Txn ID (including requests received before SMS sync).</p><p><b><?=number_format($apiMetrics['result_pending'] ?? 0)?></b> pending · <b><?=number_format($apiMetrics['result_failed'] ?? 0)?></b> not found/failed · <b><?=number_format($apiMetrics['result_duplicate'] ?? 0)?></b> duplicate results.</p><a class="btn secondary" href="/admin?tab=unverified&amp;period=<?=h($period)?>&amp;month=<?=h($month)?>&amp;year=<?=h((string)$reportYear)?>">Review unchecked payments</a></section></div>
       <section class="panel"><div class="panelhead"><h2>SIM-wise money flow</h2><span class="badge"><?=count($simSummary)?> lines</span></div><p>Incoming এবং outgoing payment SMS যে SIM slot দিয়ে এসেছে, সেই SIM অনুযায়ী হিসাব। পুরোনো transaction-এ SIM data না থাকলে Legacy / unknown SIM দেখাবে. <?php if($rangeTruncated): ?><b>Note: transaction list is capped at 20,000 records. Current-version SIM totals use daily/monthly aggregates; older records without SIM aggregates are estimated from loaded rows.</b><?php endif;?></p><div class="tablewrap"><table><thead><tr><th>SIM / Carrier</th><th>Number</th><th>Payments</th><th>Received</th><th>Sent</th><th>Net</th></tr></thead><tbody><?php if(!$simSummary):?><tr><td colspan="6" class="empty">No SIM-tagged transactions in this period.</td></tr><?php else: foreach($simSummary as $sim):?><tr><td class="wrap-cell"><?=h((string)$sim['label'])?><?php if($sim['carrier']!==''):?><small class="muted"><?=h((string)$sim['carrier'])?></small><?php endif;?></td><td><?=h((string)($sim['number']!==''?$sim['number']:'Not supplied by Android'))?></td><td><?=number_format((int)$sim['count'])?></td><td class="mint"><?=h(money((float)$sim['incoming']))?></td><td class="amber"><?=h(money((float)$sim['outgoing']))?></td><td><?=h(money((float)$sim['incoming']-(float)$sim['outgoing']))?></td></tr><?php endforeach; endif;?></tbody></table></div></section>
       <section class="panel"><div class="panelhead"><h2>Latest payments</h2><a class="btn secondary small" href="/admin?tab=transactions&amp;period=<?=h($period)?>&amp;month=<?=h($month)?>&amp;year=<?=h((string)$reportYear)?>">View all</a></div><?php if (!$transactions): ?><div class="empty">No payments in this selected period yet.</div><?php else: ?><div class="tablewrap"><table><thead><tr><th>Amount</th><th>Sender</th><th>Sender role</th><th>Txn ID</th><th>Method</th><th>SIM / Line</th><th>Type</th><th>Direction</th><th>Status</th></tr></thead><tbody><?php $n=0; foreach ($transactions as $id=>$tx): if (!is_array($tx)||$n++>=12) continue; ?><tr><td><?=h(money((float)($tx['amount']??0)))?></td><td><?=h((string)($tx['sender']??''))?></td><td><?=h((string)($tx['counterparty_role']??''))?></td><td><?=h((string)($tx['txn_id']??''))?></td><td><?=h(strtoupper((string)($tx['method']??'')))?></td><td class="wrap-cell"><?=h((string)($tx['sim_label']??'Legacy / unknown SIM'))?> <?=h((string)($tx['sim_number']??''))?></td><td><?=h((string)($tx['transaction_type']??''))?></td><td><?=h(strtoupper((string)($tx['direction']??'')))?></td><td><?=$badge(strtoupper((string)($tx['status']??'UNUSED')),($tx['status']??'unused')==='used')?></td></tr><?php endforeach; ?></tbody></table></div><?php endif; ?></section>
+    <?php elseif ($tab === 'sim'): ?>
+      <section class="panel"><div class="panelhead"><h2>SIM-wise Income / Expense Analytics</h2><span class="badge good"><?=h($periodLabel)?></span></div><p>SIM নম্বর লিখে নির্দিষ্ট লাইনের হিসাব খুঁজুন। নির্বাচিত সময় অনুযায়ী Received, Sent, Net এবং transaction count দেখানো হবে। Android যদি SIM-এর phone number OS থেকে না দেয়, তাহলে carrier / SIM slot দিয়ে খুঁজুন।</p><form class="filter" method="get"><input type="hidden" name="tab" value="sim"><input type="hidden" name="period" value="<?=h($period)?>"><input type="hidden" name="month" value="<?=h($month)?>"><input type="hidden" name="year" value="<?=h((string)$reportYear)?>"><input type="hidden" name="date" value="<?=h($reportDate)?>"><input type="hidden" name="from" value="<?=h($rangeFrom)?>"><input type="hidden" name="to" value="<?=h($rangeTo)?>"><div class="wide"><label>SIM phone number / carrier / slot</label><input name="simq" value="<?=h($simSearchRaw)?>" placeholder="017XXXXXXXX / Grameenphone / SIM 1"></div><div><label>&nbsp;</label><button>Search SIM</button></div><div><label>&nbsp;</label><a class="btn secondary" href="/admin?tab=sim&amp;period=<?=h($period)?>&amp;month=<?=h($month)?>&amp;year=<?=h((string)$reportYear)?>">Clear</a></div></form><div class="stats"><div class="stat"><div class="label">SIM LINES FOUND</div><div class="value blue"><?=count($simSummary)?></div><div class="hint">Registered SIM identities</div></div><div class="stat"><div class="label">TOTAL RECEIVED</div><div class="value mint"><?=h(money(array_sum(array_map(function($v){return (float)$v['incoming'];},$simSummary))))?></div><div class="hint">Incoming transactions</div></div><div class="stat"><div class="label">TOTAL SENT</div><div class="value amber"><?=h(money(array_sum(array_map(function($v){return (float)$v['outgoing'];},$simSummary))))?></div><div class="hint">Outgoing transactions</div></div><div class="stat"><div class="label">NET</div><div class="value"><?=h(money(array_sum(array_map(function($v){return (float)$v['incoming']-(float)$v['outgoing'];},$simSummary))))?></div><div class="hint">Received minus sent</div></div></div><div class="tablewrap"><table><thead><tr><th>SIM / Carrier</th><th>SIM Number</th><th>Slot</th><th>Payments</th><th>Received</th><th>Sent</th><th>Net</th><th>Income count</th><th>Expense count</th></tr></thead><tbody><?php if(!$simSummary):?><tr><td colspan="9" class="empty">No SIM information matches this search and period.</td></tr><?php else:foreach($simSummary as $sim):?><tr><td><?=h((string)$sim['label'])?><?php if($sim['carrier']!==''):?><small class="muted"><?=h((string)$sim['carrier'])?></small><?php endif;?></td><td><?=h((string)($sim['number']!==''?$sim['number']:'Not supplied'))?></td><td><?=h((string)($sim['slot']!==''?$sim['slot']:'Unknown'))?></td><td><?=number_format((int)$sim['count'])?></td><td class="mint"><?=h(money((float)$sim['incoming']))?></td><td class="amber"><?=h(money((float)$sim['outgoing']))?></td><td><?=h(money((float)$sim['incoming']-(float)$sim['outgoing']))?></td><td><?=number_format((int)$sim['incoming_count'])?></td><td><?=number_format((int)$sim['outgoing_count'])?></td></tr><?php endforeach;endif;?></tbody></table></div></section>
     <?php elseif ($tab === 'transactions' || $tab === 'unverified'): ?>
-      <section class="panel"><div class="panelhead"><h2><?=h($tab==='unverified'?'Payments not requested by API':'Payment transactions')?></h2><span class="badge"><?=count($filtered)?> shown</span></div><form class="filter" method="get"><input type="hidden" name="tab" value="<?=h($tab)?>"><input type="hidden" name="month" value="<?=h($month)?>"><input type="hidden" name="period" value="<?=h($period)?>"><input type="hidden" name="year" value="<?=h((string)$reportYear)?>"><div class="wide"><label>Search Txn ID or sender number</label><input name="q" value="<?=h($search)?>" placeholder="Transaction ID / 01XXXXXXXXX"></div><div><label>Method</label><select name="method"><option value="">All methods</option><?php foreach(['bkash','nagad','rocket'] as $m):?><option value="<?=$m?>" <?=$methodFilter===$m?'selected':''?>><?=ucfirst($m)?></option><?php endforeach;?></select></div><div><label>Status</label><select name="status"><option value="">All</option><?php foreach(['unused','used','pending','failed','refunded'] as $s):?><option value="<?=$s?>" <?=$statusFilter===$s?'selected':''?>><?=ucfirst($s)?></option><?php endforeach;?></select></div><div><label>Transaction type</label><select name="type"><option value="">All types</option><?php foreach(['send_money','cash_in','payment_received','cash_out','money_received','bill_payment','add_money','remittance','other_payment'] as $t):?><option value="<?=$t?>" <?=$typeFilter===$t?'selected':''?>><?=h(ucwords(str_replace('_',' ',$t)))?></option><?php endforeach;?></select></div><div><label>Direction</label><select name="direction"><option value="">All</option><?php foreach(['credit','debit','unknown'] as $d):?><option value="<?=$d?>" <?=$directionFilter===$d?'selected':''?>><?=ucfirst($d)?></option><?php endforeach;?></select></div><div><label>SIM / Line</label><select name="sim"><option value="">All SIMs</option><?php foreach($simSummary as $sk=>$sim):?><option value="<?=h((string)$sk)?>" <?= $simFilter===$sk?'selected':'' ?>><?=h((string)$sim['label'])?></option><?php endforeach;?></select></div><div><label>&nbsp;</label><button>Filter</button></div></form><?php if (!$filtered): ?><div class="empty">No transactions match these filters.</div><?php else: ?><div class="tablewrap"><table><thead><tr><th>Amount</th><th>Sender</th><th>Sender role</th><th>Txn ID</th><th>Method</th><th>SIM / Line</th><th>Type</th><th>Direction</th><th>Status</th><th>API attempts</th><th>Received</th><th>Update</th></tr></thead><tbody><?php foreach($filtered as $id=>$tx): ?><tr><td><?=h(money((float)($tx['amount']??0)))?></td><td><?=h((string)($tx['sender']??''))?></td><td><?=h((string)($tx['counterparty_role']??''))?></td><td><?=h((string)($tx['txn_id']??''))?></td><td><?=h(strtoupper((string)($tx['method']??'')))?></td><td class="wrap-cell"><?=h((string)($tx['sim_label']??'Legacy / unknown SIM'))?> <?=h((string)($tx['sim_number']??''))?><?php if(!empty($tx['sim_carrier'])):?> · <?=h((string)$tx['sim_carrier'])?><?php endif;?></td><td><?=h((string)($tx['transaction_type']??''))?></td><td><?=h((string)($tx['direction']??''))?></td><td><?=$badge(strtoupper((string)($tx['status']??'UNUSED')),($tx['status']??'unused')==='used')?></td><td><?=number_format((int)($tx['verify_attempt_count']??0))?></td><td><?=!empty($tx['transaction_at'])?h((string)$tx['transaction_at']):h(date('d/m/Y H:i',(int)($tx['received_at_ms']??0)/1000))?></td><td><form method="post" class="inlineform"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="status_update"><input type="hidden" name="txn_key" value="<?=h((string)$id)?>"><select name="status"><option value="unused">unused</option><option value="used">used</option><option value="pending">pending</option><option value="failed">failed</option><option value="refunded">refunded</option></select><button class="small">Save</button></form></td></tr><?php endforeach;?></tbody></table></div><?php endif;?></section>
+      <section class="panel"><div class="panelhead"><h2><?=h($tab==='unverified'?'Payments not requested by API':'Payment transactions')?></h2><span class="badge"><?=count($filtered)?> shown</span></div><form class="filter" method="get"><input type="hidden" name="tab" value="<?=h($tab)?>"><input type="hidden" name="month" value="<?=h($month)?>"><input type="hidden" name="period" value="<?=h($period)?>"><input type="hidden" name="year" value="<?=h((string)$reportYear)?>"><div class="wide"><label>Keyword</label><input name="q" value="<?=h($search)?>" placeholder="Search text"></div><div><label>Sender / SIM number</label><input name="number" value="<?=h((string)($_GET['number']??''))?>" placeholder="01XXXXXXXXX"></div><div><label>Transaction ID</label><input name="txn_id" value="<?=h($txnFilter)?>" placeholder="Txn ID"></div><div><label>Exact amount (BDT)</label><input type="number" step="0.01" min="0" name="amount" value="<?=h($amountFilterRaw)?>" placeholder="500.00"></div><div><label>From date</label><input type="date" name="date_from" value="<?=h($dateFromFilter)?>"></div><div><label>To date</label><input type="date" name="date_to" value="<?=h($dateToFilter)?>"></div><div><label>Method</label><select name="method"><option value="">All methods</option><?php foreach(['bkash','nagad','rocket'] as $m):?><option value="<?=$m?>" <?=$methodFilter===$m?'selected':''?>><?=ucfirst($m)?></option><?php endforeach;?></select></div><div><label>Status</label><select name="status"><option value="">All</option><?php foreach(['unused','used','pending','failed','refunded'] as $s):?><option value="<?=$s?>" <?=$statusFilter===$s?'selected':''?>><?=ucfirst($s)?></option><?php endforeach;?></select></div><div><label>Transaction type</label><select name="type"><option value="">All types</option><?php foreach(['send_money','cash_in','payment_received','cash_out','money_received','bill_payment','add_money','remittance','other_payment'] as $t):?><option value="<?=$t?>" <?=$typeFilter===$t?'selected':''?>><?=h(ucwords(str_replace('_',' ',$t)))?></option><?php endforeach;?></select></div><div><label>Direction</label><select name="direction"><option value="">All</option><?php foreach(['credit','debit','unknown'] as $d):?><option value="<?=$d?>" <?=$directionFilter===$d?'selected':''?>><?=ucfirst($d)?></option><?php endforeach;?></select></div><div><label>SIM / Line</label><select name="sim"><option value="">All SIMs</option><?php foreach($simSummary as $sk=>$sim):?><option value="<?=h((string)$sk)?>" <?= $simFilter===$sk?'selected':'' ?>><?=h((string)$sim['label'])?></option><?php endforeach;?></select></div><div><label>&nbsp;</label><button>Filter</button></div></form><?php if (!$filtered): ?><div class="empty">No transactions match these filters.</div><?php else: ?><div class="tablewrap"><table><thead><tr><th>Amount</th><th>Sender</th><th>Sender role</th><th>Txn ID</th><th>Method</th><th>SIM / Line</th><th>Type</th><th>Direction</th><th>Status</th><th>API attempts</th><th>Received</th><th>Update</th></tr></thead><tbody><?php foreach($filtered as $id=>$tx): ?><tr><td><?=h(money((float)($tx['amount']??0)))?></td><td><?=h((string)($tx['sender']??''))?></td><td><?=h((string)($tx['counterparty_role']??''))?></td><td><?=h((string)($tx['txn_id']??''))?></td><td><?=h(strtoupper((string)($tx['method']??'')))?></td><td class="wrap-cell"><?=h((string)($tx['sim_label']??'Legacy / unknown SIM'))?> <?=h((string)($tx['sim_number']??''))?><?php if(!empty($tx['sim_carrier'])):?> · <?=h((string)$tx['sim_carrier'])?><?php endif;?></td><td><?=h((string)($tx['transaction_type']??''))?></td><td><?=h((string)($tx['direction']??''))?></td><td><?=$badge(strtoupper((string)($tx['status']??'UNUSED')),($tx['status']??'unused')==='used')?></td><td><?=number_format((int)($tx['verify_attempt_count']??0))?></td><td><?=!empty($tx['transaction_at'])?h((string)$tx['transaction_at']):h(date('d/m/Y H:i',(int)($tx['received_at_ms']??0)/1000))?></td><td><form method="post" class="inlineform"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="status_update"><input type="hidden" name="txn_key" value="<?=h((string)$id)?>"><select name="status"><option value="unused">unused</option><option value="used">used</option><option value="pending">pending</option><option value="failed">failed</option><option value="refunded">refunded</option></select><button class="small">Save</button></form></td></tr><?php endforeach;?></tbody></table></div><?php endif;?></section>
     <?php elseif ($tab === 'duplicates'): ?>
       <section class="panel"><div class="panelhead"><h2>Duplicate transaction attempts</h2><span class="badge warn"><?=count($duplicateRows)?> events</span></div><p>একই Method + Transaction ID আগে পাওয়া থাকলে নতুন SMS overwrite করা হয় না। একই SMS retry হলে আবার duplicate count হয় না; আলাদা SMS-এ একই Txn ID এলে এখানে দেখা যায়।</p><div class="tablewrap"><table><thead><tr><th>Method</th><th>Txn ID</th><th>Amount</th><th>Installation</th><th>Detected</th></tr></thead><tbody><?php foreach($duplicateRows as $dup):if(!is_array($dup))continue;?><tr><td><?=h(strtoupper((string)($dup['method']??'')))?></td><td><?=h((string)($dup['txn_id']??''))?></td><td><?=h(money((float)($dup['amount']??0)))?></td><td><?=h(substr((string)($dup['device_id']??''),0,16))?></td><td><?=!empty($dup['stored_at'])?h(date('d/m/Y H:i',(int)$dup['stored_at'])):'-'?></td></tr><?php endforeach;?></tbody></table></div></section>
     <?php elseif ($tab === 'sms'): ?>
       <section class="panel"><div class="panelhead"><h2>Payment SMS in selected period</h2><span class="badge"><?=count($smsRows)?> records<?=count($smsRows)>=2000?' · latest 2,000':''?></span></div><div class="tablewrap"><table><thead><tr><th>Amount</th><th>Counterparty</th><th>Txn ID</th><th>Method</th><th>SMS Sender</th><th>SIM / Line</th><th>Type</th><th>Message</th></tr></thead><tbody><?php foreach($smsRows as $sms):if(!is_array($sms))continue;?><tr><td><?=h(money((float)($sms['amount']??0)))?></td><td><?=h((string)($sms['sender']??''))?></td><td><?=h((string)($sms['txn_id']??''))?></td><td><?=h(strtoupper((string)($sms['method']??'')))?></td><td><?=h((string)($sms['sms_sender']??''))?></td><td class="wrap-cell"><?=h((string)($sms['sim_label']??'Legacy / unknown SIM'))?> <?=h((string)($sms['sim_number']??''))?></td><td><?=h((string)($sms['transaction_type']??''))?></td><td class="message-cell"><details><summary><?=h(u_substr((string)($sms['message']??''),0,110))?><?=u_substr((string)($sms['message']??''),110,1)!=='' ? '…' : ''?></summary><div class="full-message"><?=nl2br(h((string)($sms['message']??'')))?></div></details></td></tr><?php endforeach;?></tbody></table></div></section>
     <?php elseif ($tab === 'api'): ?>
-      <div class="grid2"><section class="panel"><div class="panelhead"><h2>App upload keys</h2><span class="badge good">Multi-device</span></div><p>একই App Key একাধিক Android ফোনে ব্যবহার করা যাবে। Key দিয়ে শুধু payment SMS upload, heartbeat ও device status নিয়ন্ত্রণ হবে।</p><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="create_app_key"><label>Key label</label><input name="label" placeholder="Main Android / Backup phones"><button>Create app key</button></form><div class="tablewrap" style="margin-top:12px"><table><thead><tr><th>Key Hint</th><th>Label</th><th>Status</th><th>Copy key</th><th>Action</th></tr></thead><tbody><?php foreach($appKeys as $hash=>$k):if(!is_array($k))continue;$copySecret=decrypt_admin_key($k);?><tr><td><?=h((string)($k['key_hint']??''))?></td><td><?=h((string)($k['label']??''))?></td><td><?=$badge(!empty($k['active'])?'ACTIVE':'REVOKED',!empty($k['active']))?></td><td><?php if($copySecret!==''):?><button type="button" class="secondary small" data-secret="<?=h($copySecret)?>" onclick="navigator.clipboard.writeText(this.dataset.secret).then(()=>this.textContent='Copied')">Copy key</button><?php else:?><span class="muted">Legacy key</span><?php endif;?></td><td><?php if(!empty($k['active'])):?><form method="post" style="display:inline-block"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="revoke_app_key"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><button class="danger small">Revoke</button></form><?php endif;?><form method="post" style="display:inline-block" onsubmit="return confirm('Permanently delete this App Upload Key? Devices using it will lose access.')"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="delete_app_key"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><button class="danger small">Delete</button></form></td></tr><?php endforeach;?></tbody></table></div></section><section class="panel"><div class="panelhead"><h2>Verification API keys</h2><span class="badge good">Multi-client</span></div><p>Website, Telegram Bot বা অন্য Backend থেকে payment verify করার জন্য। API Key একইসঙ্গে একাধিক integration ব্যবহার করতে পারে। প্রতিটি Key-এর Wait ও Polling আলাদাভাবে নির্ধারণ করা যাবে।</p><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="create_verify_key"><label>Key label</label><input name="label" placeholder="Telegram Bot / Website"><div class="grid3"><div><label>Wait for SMS (seconds · 0–60)</label><input type="number" name="wait_seconds" min="0" max="60" value="10"></div><div><label>Polling interval (ms · 250–5000)</label><input type="number" name="poll_interval_ms" min="250" max="5000" step="250" value="1000"></div><div><label>Requests / minute (10–300)</label><input type="number" name="rate_limit_per_min" min="10" max="300" value="120"></div></div><button class="secondary">Create verification key</button></form><div class="tablewrap" style="margin-top:12px"><table><thead><tr><th>Key Hint</th><th>Label</th><th>Status</th><th>Copy key</th><th>Wait · Poll · Rate/min</th><th>Action</th></tr></thead><tbody><?php foreach($verifyKeys as $hash=>$k):if(!is_array($k))continue;$copySecret=decrypt_admin_key($k);?><tr><td><?=h((string)($k['key_hint']??''))?></td><td><?=h((string)($k['label']??''))?></td><td><?=$badge(!empty($k['active'])?'ACTIVE':'REVOKED',!empty($k['active']))?></td><td><?php if($copySecret!==''):?><button type="button" class="secondary small" data-secret="<?=h($copySecret)?>" onclick="navigator.clipboard.writeText(this.dataset.secret).then(()=>this.textContent='Copied')">Copy key</button><?php else:?><span class="muted">Legacy key</span><?php endif;?></td><td><?php if(!empty($k['active'])):?><form method="post" class="inlineform"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="update_verify_key_timing"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><input aria-label="Wait seconds" title="Wait seconds" type="number" name="wait_seconds" min="0" max="60" value="<?=h((string)($k['wait_seconds']??10))?>" style="width:72px"><input aria-label="Polling milliseconds" title="Polling milliseconds" type="number" name="poll_interval_ms" min="250" max="5000" step="250" value="<?=h((string)($k['poll_interval_ms']??1000))?>" style="width:90px"><input aria-label="Requests per minute" title="Requests per minute" type="number" name="rate_limit_per_min" min="10" max="300" value="<?=h((string)($k['rate_limit_per_min']??120))?>" style="width:82px"><button class="small">Save</button></form><?php else:?>—<?php endif;?></td><td><?php if(!empty($k['active'])):?><form method="post" style="display:inline-block"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="revoke_verify_key"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><button class="danger small">Revoke</button></form><?php endif;?><form method="post" style="display:inline-block" onsubmit="return confirm('Permanently delete this Verification API Key? Integrations using it will stop working.')"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="delete_verify_key"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><button class="danger small">Delete</button></form></td></tr><?php endforeach;?></tbody></table></div></section></div>
+      <div class="grid2"><section class="panel"><div class="panelhead"><h2>App upload keys</h2><span class="badge good">Multi-device</span></div><p>একই App Key একাধিক Android ফোনে ব্যবহার করা যাবে। Key দিয়ে শুধু payment SMS upload, heartbeat ও device status নিয়ন্ত্রণ হবে।</p><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="create_app_key"><label>Key label</label><input name="label" placeholder="Main Android / Backup phones"><button>Create app key</button></form><div class="tablewrap" style="margin-top:12px"><table><thead><tr><th>Key Hint</th><th>Label</th><th>Status</th><th>Copy key</th><th>Action</th></tr></thead><tbody><?php foreach($appKeys as $hash=>$k):if(!is_array($k))continue;$copySecret=decrypt_admin_key($k);?><tr><td><?=h((string)($k['key_hint']??''))?></td><td><?=h((string)($k['label']??''))?></td><td><?=$badge(!empty($k['active'])?'ACTIVE':'REVOKED',!empty($k['active']))?></td><td><?php if($copySecret!==''):?><button type="button" class="secondary small" data-secret="<?=h($copySecret)?>" onclick="navigator.clipboard.writeText(this.dataset.secret).then(()=>this.textContent='Copied')">Copy key</button><?php else:?><span class="muted">Legacy key</span><?php endif;?></td><td><?php if(!empty($k['active'])):?><form method="post" style="display:inline-block"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="revoke_app_key"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><button class="danger small">Revoke</button></form><?php endif;?><form method="post" style="display:inline-block" onsubmit="return confirm('Permanently delete this App Upload Key? Devices using it will lose access.')"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="delete_app_key"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><button class="danger small">Delete</button></form></td></tr><?php endforeach;?></tbody></table></div></section><section class="panel"><div class="panelhead"><h2>Verification API keys</h2><span class="badge good">Multi-client</span></div><p>Website, Telegram Bot বা অন্য Backend থেকে payment verify করার জন্য। API Key একইসঙ্গে একাধিক integration ব্যবহার করতে পারে। প্রতিটি Key-এর Wait ও Polling আলাদাভাবে নির্ধারণ করা যাবে।</p><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="create_verify_key"><label>Key label</label><input name="label" placeholder="Telegram Bot / Website"><div class="grid3"><div><label>Wait for SMS (seconds · 0–60)</label><input type="number" name="wait_seconds" min="0" max="60" value="10"></div><div><label>Polling interval (ms · 150–3000)</label><input type="number" name="poll_interval_ms" min="150" max="3000" step="50" value="250"></div><div><label>Requests / minute (10–300)</label><input type="number" name="rate_limit_per_min" min="10" max="300" value="120"></div></div><button class="secondary">Create verification key</button></form><div class="tablewrap" style="margin-top:12px"><table><thead><tr><th>Key Hint</th><th>Label</th><th>Status</th><th>Copy key</th><th>Wait · Poll · Rate/min</th><th>Action</th></tr></thead><tbody><?php foreach($verifyKeys as $hash=>$k):if(!is_array($k))continue;$copySecret=decrypt_admin_key($k);?><tr><td><?=h((string)($k['key_hint']??''))?></td><td><?=h((string)($k['label']??''))?></td><td><?=$badge(!empty($k['active'])?'ACTIVE':'REVOKED',!empty($k['active']))?></td><td><?php if($copySecret!==''):?><button type="button" class="secondary small" data-secret="<?=h($copySecret)?>" onclick="navigator.clipboard.writeText(this.dataset.secret).then(()=>this.textContent='Copied')">Copy key</button><?php else:?><span class="muted">Legacy key</span><?php endif;?></td><td><?php if(!empty($k['active'])):?><form method="post" class="inlineform"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="update_verify_key_timing"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><input aria-label="Wait seconds" title="Wait seconds" type="number" name="wait_seconds" min="0" max="60" value="<?=h((string)($k['wait_seconds']??10))?>" style="width:72px"><input aria-label="Polling milliseconds" title="Polling milliseconds" type="number" name="poll_interval_ms" min="150" max="3000" step="50" value="<?=h((string)($k['poll_interval_ms']??250))?>" style="width:90px"><input aria-label="Requests per minute" title="Requests per minute" type="number" name="rate_limit_per_min" min="10" max="300" value="<?=h((string)($k['rate_limit_per_min']??120))?>" style="width:82px"><button class="small">Save</button></form><?php else:?>—<?php endif;?></td><td><?php if(!empty($k['active'])):?><form method="post" style="display:inline-block"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="revoke_verify_key"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><button class="danger small">Revoke</button></form><?php endif;?><form method="post" style="display:inline-block" onsubmit="return confirm('Permanently delete this Verification API Key? Integrations using it will stop working.')"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="delete_verify_key"><input type="hidden" name="hash" value="<?=h((string)$hash)?>"><button class="danger small">Delete</button></form></td></tr><?php endforeach;?></tbody></table></div></section></div>
       <section class="panel"><h2>Verification API example</h2><p>GET request supports `amount` and legacy `ammount`; POST + X-API-Key header is safer. Key query string public browser code-এ রাখবে না।</p><div class="keybox">GET /api/verify?apikey=PBV_KEY&amp;amount=505&amp;txnid=DKD7G02UOP&amp;method=bkash</div><div class="sectionnote">Transaction ID-only lookup: `GET /api/verify?apikey=PBV_KEY&amp;txnid=DKD7G02UOP` (only Transaction ID rule ON থাকলে amount/method/number input লাগবে না; matching complete transaction record response-এ আসবে)। `status` Boolean, `result` result label. প্রতি PBV key-এর নিজস্ব rolling requests/minute limit-ও এখানে set করা যায়.</div><p>Selected period-এর মোট Verify Request: <b><?=number_format($apiRequests)?></b> · Success: <b><?=number_format($apiSuccess)?></b> · Pending: <b><?=number_format($apiMetrics['result_pending']??0)?></b> · Failed: <b><?=number_format($apiMetrics['result_failed']??0)?></b></p></section>
+    <?php elseif ($tab === 'monitor'): ?>
+      <div class="stats"><div class="stat"><div class="label">API REQUESTS</div><div class="value blue"><?=number_format($apiRequests)?></div><div class="hint">Selected period</div></div><div class="stat"><div class="label">SUCCESS</div><div class="value mint"><?=number_format($apiSuccess)?></div><div class="hint"><?=h((string)$apiSuccessRate)?>% success rate</div></div><div class="stat"><div class="label">FAILURE / NON-SUCCESS</div><div class="value red"><?=number_format($apiFailure)?></div><div class="hint">Includes not found, duplicate, mismatch and rate limit outcomes</div></div><div class="stat"><div class="label">ACTIVE DEVICES</div><div class="value"><?=number_format(count(array_filter($devices,function($d){return is_array($d)&&!empty($d['active'])&&empty($d['blocked'])&&(time()-(int)($d['last_heartbeat_at']??0))<=180;})))?></div><div class="hint">Heartbeat within 3 minutes</div></div></div>
+      <section class="panel"><div class="panelhead"><h2>API request count by key</h2><span class="badge good">Aggregated · no plaintext keys</span></div><p>প্রতি PBV key-এর request, success, failure এবং success rate দেখানো হয়। এটা per-key result counters-এর aggregate; প্রতিটি request-এর body বা secret key log করা হয় না।</p><div class="tablewrap"><table><thead><tr><th>Key label</th><th>Key hint</th><th>Requests</th><th>Success</th><th>Failure</th><th>Success rate</th><th>Status</th></tr></thead><tbody><?php if(!$apiKeyStats):?><tr><td colspan="7" class="empty">No per-key API activity for this period yet.</td></tr><?php else:foreach($apiKeyStats as $keyStat):?><tr><td><?=h($keyStat['label'])?></td><td><?=h($keyStat['hint'])?></td><td><?=number_format($keyStat['requests'])?></td><td class="mint"><?=number_format($keyStat['success'])?></td><td class="red"><?=number_format($keyStat['failure'])?></td><td><?=h((string)$keyStat['rate'])?>%</td><td><?=$badge($keyStat['rate']>=95?'HEALTHY':($keyStat['rate']>=80?'WATCH':'CHECK'),$keyStat['rate']>=95)?></td></tr><?php endforeach;endif;?></tbody></table></div><p class="sectionnote">Rate limit rejection is recorded as a non-success. Malformed requests rejected before API-key authentication may not be attributed to a specific key.</p></section>
     <?php elseif ($tab === 'data'): ?>
       <section class="panel"><div class="panelhead"><h2>Firebase Realtime Database data</h2><span class="badge good">Read only · Admin</span></div><p>এখানে selected Firebase node-এর বর্তমান data দেখা যাবে। Service Account key বা raw API key কখনো Firebase-এ সংরক্ষণ করা হয় না।</p><form method="get" class="filter"><input type="hidden" name="tab" value="data"><input type="hidden" name="month" value="<?=h($month)?>"><input type="hidden" name="period" value="<?=h($period)?>"><input type="hidden" name="year" value="<?=h((string)$reportYear)?>"><div class="wide"><label>Firebase path</label><select name="node"><?php foreach(['verification'=>'settings/verification','devices'=>'devices','app_keys'=>'settings/app_upload_keys','api_keys'=>'settings/verification_api_keys','monthly_report'=>'reports/monthly/' . $month . '/shards','monthly_api'=>'metrics/api_monthly/' . $month . '/shards'] as $k=>$label):?><option value="<?=h($k)?>" <?=$dataNode===$k?'selected':''?>><?=h($label)?></option><?php endforeach;?></select></div><div><label>&nbsp;</label><button>Load node</button></div></form><div class="keybox" style="white-space:pre;overflow:auto;max-height:560px;font-size:11px"><?=h(json_encode($firebaseDataView, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) ?: '{}')?></div></section>
     <?php elseif ($tab === 'devices'): ?>
-      <section class="panel"><div class="panelhead"><h2>Connected Android installations</h2><span class="badge"><?=count($devices)?> total · <?=$devicesNeedAttention?> need attention</span></div><p>এক নজরে permission, heartbeat ও pending queue health। বর্তমানে মোট <?=$pendingQueueTotal?>টি payment SMS device queue-তে pending আছে। কোনো device key binding বা signer SHA-256 নেই; একই App Upload Key একাধিক device-এ ব্যবহার করা যায়।</p><div class="tablewrap"><table><thead><tr><th>Installation ID</th><th>Label</th><th>Model</th><th>Status</th><th>Last Login</th><th>Last Connect</th><th>Last Heartbeat</th><th>App Version</th><th>Android SDK</th><th>SMS</th><th>Notifications</th><th>Battery</th><th>Background</th><th>Network</th><th>Pending Queue</th><th>Control</th></tr></thead><tbody><?php foreach($devices as $id=>$d):if(!is_array($d))continue;?><tr><td><?=h(substr((string)$id,0,18))?>…</td><td><?=h((string)($d['label']??''))?></td><td><?=h((string)($d['model']??''))?></td><td><?=$badge((string)($d['connection_state']??'unknown'),!empty($d['active'])&&empty($d['blocked']))?></td><td><?=!empty($d['last_login_at'])?h(date('d/m/Y H:i',(int)$d['last_login_at'])):'-'?></td><td><?=!empty($d['last_connect_at'])?h(date('d/m/Y H:i',(int)$d['last_connect_at'])):'-'?></td><td><?=!empty($d['last_heartbeat_at'])?h(date('d/m/Y H:i',(int)$d['last_heartbeat_at'])):'-'?></td><td><?=h((string)($d['app_version']??'-'))?></td><td><?=!empty($d['android_sdk'])?h((string)$d['android_sdk']):'-'?></td><td><?=$badge(array_key_exists('permission_sms',$d)?(!empty($d['permission_sms'])?'GRANTED':'MISSING'):'UNKNOWN',array_key_exists('permission_sms',$d)&&!empty($d['permission_sms']))?></td><td><?=$badge(array_key_exists('permission_notifications',$d)?(!empty($d['permission_notifications'])?'ALLOWED':'BLOCKED'):'UNKNOWN',array_key_exists('permission_notifications',$d)&&!empty($d['permission_notifications']))?></td><td><?=$badge(array_key_exists('permission_battery_exempt',$d)?(!empty($d['permission_battery_exempt'])?'EXEMPT':'OPTIMIZED'):'UNKNOWN',array_key_exists('permission_battery_exempt',$d)&&!empty($d['permission_battery_exempt']))?></td><td><?=$badge(array_key_exists('background_restricted',$d)?(!empty($d['background_restricted'])?'RESTRICTED':'OK'):'UNKNOWN',array_key_exists('background_restricted',$d)&&empty($d['background_restricted']))?></td><td><?=$badge(array_key_exists('network_connected',$d)?(!empty($d['network_connected'])?'ONLINE':'OFFLINE'):'UNKNOWN',array_key_exists('network_connected',$d)&&!empty($d['network_connected']))?></td><td><?=number_format((int)($d['pending_queue_count']??0))?></td><td><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="device_toggle"><input type="hidden" name="device_id" value="<?=h((string)$id)?>"><input type="hidden" name="blocked" value="<?=empty($d['blocked'])?'1':'0'?>"><button class="<?=empty($d['blocked'])?'danger':'small'?> small"><?=empty($d['blocked'])?'Block':'Unblock'?></button></form></td></tr><?php endforeach;?></tbody></table></div></section>
+      <section class="panel"><div class="panelhead"><h2>Connected Android installations</h2><span class="badge"><?=count($devices)?> total · <?=$devicesNeedAttention?> need attention</span></div><p>এক নজরে permission, heartbeat ও pending queue health। বর্তমানে মোট <?=$pendingQueueTotal?>টি payment SMS device queue-তে pending আছে। কোনো device key binding বা signer SHA-256 নেই; একই App Upload Key একাধিক device-এ ব্যবহার করা যায়।</p><div class="tablewrap"><table><thead><tr><th>Installation ID</th><th>Label</th><th>Model</th><th>Status</th><th>Last Login</th><th>Last Connect</th><th>Last Heartbeat</th><th>App Version</th><th>Android SDK</th><th>SMS</th><th>Notifications</th><th>Battery</th><th>Background</th><th>Network</th><th>Pending Queue</th><th>Control</th></tr></thead><tbody><?php foreach($devices as $id=>$d):if(!is_array($d))continue;?><tr><td><?=h(substr((string)$id,0,18))?>…</td><td><?=h((string)($d['label']??''))?></td><td><?=h((string)($d['model']??''))?></td><td><?php $heartbeatAge = time() - (int)($d['last_heartbeat_at'] ?? 0); $deviceState = !empty($d['blocked']) ? 'BLOCKED' : ($heartbeatAge <= 180 && !empty($d['network_connected']) ? 'ONLINE' : ($heartbeatAge <= 600 ? 'SYNC ISSUE' : 'OFFLINE')); ?><?=$badge($deviceState,$deviceState==='ONLINE')?></td><td><?=!empty($d['last_login_at'])?h(date('d/m/Y H:i',(int)$d['last_login_at'])):'-'?></td><td><?=!empty($d['last_connect_at'])?h(date('d/m/Y H:i',(int)$d['last_connect_at'])):'-'?></td><td><?=!empty($d['last_heartbeat_at'])?h(date('d/m/Y H:i',(int)$d['last_heartbeat_at'])):'-'?></td><td><?=h((string)($d['app_version']??'-'))?></td><td><?=!empty($d['android_sdk'])?h((string)$d['android_sdk']):'-'?></td><td><?=$badge(array_key_exists('permission_sms',$d)?(!empty($d['permission_sms'])?'GRANTED':'MISSING'):'UNKNOWN',array_key_exists('permission_sms',$d)&&!empty($d['permission_sms']))?></td><td><?=$badge(array_key_exists('permission_notifications',$d)?(!empty($d['permission_notifications'])?'ALLOWED':'BLOCKED'):'UNKNOWN',array_key_exists('permission_notifications',$d)&&!empty($d['permission_notifications']))?></td><td><?=$badge(array_key_exists('permission_battery_exempt',$d)?(!empty($d['permission_battery_exempt'])?'EXEMPT':'OPTIMIZED'):'UNKNOWN',array_key_exists('permission_battery_exempt',$d)&&!empty($d['permission_battery_exempt']))?></td><td><?=$badge(array_key_exists('background_restricted',$d)?(!empty($d['background_restricted'])?'RESTRICTED':'OK'):'UNKNOWN',array_key_exists('background_restricted',$d)&&empty($d['background_restricted']))?></td><td><?=$badge(array_key_exists('network_connected',$d)?(!empty($d['network_connected'])?'ONLINE':'OFFLINE'):'UNKNOWN',array_key_exists('network_connected',$d)&&!empty($d['network_connected']))?></td><td><?=number_format((int)($d['pending_queue_count']??0))?></td><td><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="device_toggle"><input type="hidden" name="device_id" value="<?=h((string)$id)?>"><input type="hidden" name="blocked" value="<?=empty($d['blocked'])?'1':'0'?>"><button class="<?=empty($d['blocked'])?'danger':'small'?> small"><?=empty($d['blocked'])?'Block':'Unblock'?></button></form></td></tr><?php endforeach;?></tbody></table></div></section>
+    <?php elseif ($tab === 'updates'): ?>
+      <section class="panel"><div class="panelhead"><h2>Publish Android App Update</h2><span class="badge good">APK update channel</span></div><p>এখানে signed APK upload করলে App Update Checker নতুন Version Code শনাক্ত করবে। App-এর package name এবং আগের release-এর signing certificate একই হতে হবে; Version Code অবশ্যই বাড়াতে হবে।</p><div class="grid2"><div><div class="stat"><div class="label">CURRENT PUBLISHED VERSION</div><div class="value blue"><?=h((string)($publishedRelease['version_name']??'Not published'))?></div><div class="hint">Version Code: <?=number_format((int)($publishedRelease['version_code']??0))?></div></div><p>APK SHA-256: <code><?=h((string)($publishedRelease['sha256']??'—'))?></code></p><p>Last published: <?=!empty($publishedRelease['published_at'])?h(date('d/m/Y H:i',(int)$publishedRelease['published_at'])):'—'?></p></div><div><form method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="publish_app_update"><label>Version Code (must increase)</label><input type="number" name="version_code" min="1" value="<?=number_format((int)($publishedRelease['version_code']??0)+1,0,'','')?>" required><label>Version Name</label><input name="version_name" maxlength="32" placeholder="3.0.0" required><label>Minimum supported Version Code (0 = no minimum)</label><input type="number" name="min_supported_version" min="0" value="0"><label>Release notes</label><textarea name="release_notes" rows="3" maxlength="1200" placeholder="Bug fixes and performance improvements"></textarea><label>Signed APK (maximum 12 MB)</label><input type="file" name="apk" accept=".apk,application/vnd.android.package-archive" required><button style="margin-top:12px">Upload &amp; Publish Update</button></form></div></div><p class="sectionnote">APK Firebase RTDB-তে Base64 অবস্থায় রাখা হবে; APK আপলোডে storage/egress খরচ বাড়তে পারে। বড় APK-এর জন্য পরবর্তী ধাপে private object storage ব্যবহার করা ভালো।</p></section>
     <?php elseif ($tab === 'settings'): ?>
-      <div class="grid2"><section class="panel"><h2>Verification rules</h2><p>Enabled rules are ANDed together. Txn ID is used for indexed lookup even if its compare switch is turned off.</p><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="save_verification"><div class="checkgrid"><?php foreach(['verify_number'=>'Sender number','verify_amount'=>'Amount','verify_txn_id'=>'Transaction ID','verify_method'=>'Payment method'] as $field=>$label):?><div class="checkitem"><label><input type="checkbox" name="<?=$field?>" <?=!empty($verification[$field])?'checked':''?>><?=h($label)?></label></div><?php endforeach;?></div><label>Wait for SMS sync (seconds, 0–60)</label><input type="number" name="wait_seconds" min="0" max="60" value="<?=h((string)$verification['wait_seconds'])?>"><label>Firebase polling interval (ms, 250–5000)</label><input type="number" name="poll_interval_ms" min="250" max="5000" step="250" value="<?=h((string)$verification['poll_interval_ms'])?>"><button style="margin-top:13px">Save verification settings</button></form></section><section class="panel"><h2>System information</h2><p>Database: Firebase Realtime Database only</p><p>Backend: Single PHP index.php</p><p>Timezone: Asia/Dhaka</p><p>Application upload keys: shared across multiple devices</p><p>Signer SHA-256: disabled</p><p>Request-by-request logs: disabled; only daily/monthly aggregate API counters are stored for reporting.</p><p>Verification API limit: per-key rolling window, 10–300 requests per minute; default 120. Admin can change each PBV key limit.</p><p>Payment records are kept by unique Method + Txn ID. Used records cannot be verified again.</p></section></div>
+      <div class="grid2"><section class="panel"><h2>Verification rules</h2><p>Enabled rules are ANDed together. Txn ID is used for indexed lookup even if its compare switch is turned off.</p><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="save_verification"><div class="checkgrid"><?php foreach(['verify_number'=>'Sender number','verify_amount'=>'Amount','verify_txn_id'=>'Transaction ID','verify_method'=>'Payment method'] as $field=>$label):?><div class="checkitem"><label><input type="checkbox" name="<?=$field?>" <?=!empty($verification[$field])?'checked':''?>><?=h($label)?></label></div><?php endforeach;?></div><label>Wait for SMS sync (seconds, 0–60)</label><input type="number" name="wait_seconds" min="0" max="60" value="<?=h((string)$verification['wait_seconds'])?>"><label>Firebase polling interval (ms, 150–3000)</label><input type="number" name="poll_interval_ms" min="150" max="3000" step="50" value="<?=h((string)$verification['poll_interval_ms'])?>"><button style="margin-top:13px">Save verification settings</button></form></section><section class="panel"><h2>Automatic Data Cleanup</h2><p>Only old raw SMS messages and duplicate-event detail rows are eligible. Canonical payment_transactions, TxnID indexes, API keys and aggregates are never deleted.</p><?php $maintenanceSettings = []; try { $maintenanceSettings = fb_get('settings/maintenance'); } catch (Throwable $ignored) {} ?><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="run_cleanup"><label>Keep data for at least (days · minimum 90)</label><input type="number" min="90" max="3650" name="retention_days" value="<?=h((string)($maintenanceSettings['cleanup_retention_days']??365))?>"><div class="checkitem"><label><input type="checkbox" name="automatic_cleanup" <?=!array_key_exists('automatic_cleanup',$maintenanceSettings)||!empty($maintenanceSettings['automatic_cleanup'])?'checked':''?>>Enable daily automatic cleanup</label></div><button style="margin-top:10px">Save &amp; Run Cleanup</button></form></section><section class="panel"><h2>System information</h2><p>Database: Firebase Realtime Database · primary + optional secondary mirror</p><p>Secondary DB: <?=firebase_slot_enabled(2)?$badge('CONFIGURED',true):$badge('NOT CONFIGURED',false)?> — optional Render environment variables: PB_FIREBASE_DATABASE_URL_2 and PB_FIREBASE_SERVICE_ACCOUNT_JSON_2. Copy the existing primary data to DB2 before enabling it; live mirroring does not backfill historical records.</p><p>Backend: Single PHP index.php</p><p>Timezone: Asia/Dhaka</p><p>Application upload keys: shared across multiple devices</p><p>Signer SHA-256: disabled</p><p>Request-by-request logs: disabled; only daily/monthly aggregate API counters are stored for reporting.</p><p>Verification API limit: per-key rolling window, 10–300 requests per minute; default 120. API polling interval can be set to 150–3000 ms. Render Free worker/memory limits still cap concurrent long-wait API requests.</p><p>Payment records are kept by unique Method + Txn ID. Used records cannot be verified again.</p></section></div>
     <?php endif; ?>
-    <footer class="muted" style="padding:16px 3px;font-size:10px">PAYMENT BRIDGE · SINGLE PHP ADMIN + API · FIREBASE RTDB · NO SQL</footer></main></div></body></html><?php
+    <footer class="muted" style="padding:16px 3px;font-size:10px">PAYMENT BRIDGE · SINGLE PHP ADMIN + API · FIREBASE RTDB · NO SQL</footer></main></div><?php if (in_array($tab, ['overview','monitor','devices'], true)): ?><script>setTimeout(function(){if(!document.hidden){window.location.reload();}},10000);</script><?php endif; ?></body></html><?php
 }
 
 $route = current_route();
