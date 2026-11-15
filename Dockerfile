@@ -2,6 +2,8 @@ FROM php:8.3-apache
 RUN apt-get update && apt-get install -y --no-install-recommends libcurl4-openssl-dev libonig-dev \
     && docker-php-ext-install curl mbstring \
     && a2enmod headers rewrite \
+    && printf '<IfModule mpm_prefork_module>\nStartServers 2\nMinSpareServers 2\nMaxSpareServers 6\nMaxRequestWorkers 16\nMaxConnectionsPerChild 1000\n</IfModule>\n' > /etc/apache2/conf-available/payment-bridge-prefork.conf \
+    && a2enconf payment-bridge-prefork \
     && sed -ri 's/AllowOverride None/AllowOverride All/g' /etc/apache2/apache2.conf \
     && sed -ri 's/Listen 80/Listen 10000/' /etc/apache2/ports.conf \
     && sed -ri 's/<VirtualHost \*:80>/<VirtualHost *:10000>/' /etc/apache2/sites-available/000-default.conf \
