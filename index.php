@@ -663,8 +663,12 @@ function api_verify(array $input): void {
     $amountPresent = $amountRaw !== null && is_numeric($amountRaw);
     $amount = $amountPresent ? (float)$amountRaw : null;
     if ($txnId === '' || strlen($txnId) > 100 || !preg_match('/^[A-Z0-9_-]+$/', $txnId)) json_out(422, ['status' => false, 'result' => 'invalid_request', 'message' => 'A valid txnid is required for lookup.']);
-    if ($amountPresent && ($amount < 0 || $amount > 100000000)) json_out(422, ['status' => false, 'result' => 'invalid_request', 'message' => 'Invalid amount.']);
+    if ($checks['amount'] && $amountPresent && ($amount < 0 || $amount > 100000000)) json_out(422, ['status' => false, 'result' => 'invalid_request', 'message' => 'Invalid amount.']);
     if ($checks['method'] && !in_array($method, ['bkash', 'nagad', 'rocket'], true)) json_out(422, ['status' => false, 'result' => 'invalid_request', 'message' => 'A valid method is required.']);
+    // When a comparison switch is OFF, its optional GET/POST value is intentionally ignored.
+    if (!$checks['amount']) { $amountPresent = false; $amount = null; }
+    if (!$checks['method']) $method = '';
+    if (!$checks['number']) $number = '';
     $missing = [];
     if ($checks['number'] && $number === '') $missing[] = 'number';
     if ($checks['amount'] && !$amountPresent) $missing[] = 'amount';
@@ -741,7 +745,7 @@ function api_verify(array $input): void {
             if (!empty($record['day'])) {
                 try { add_sharded_totals('reports/daily/' . (string)$record['day'], ['used_count' => 1], 1.0); } catch (Throwable $ignored) {}
             }
-            verify_response(true, 'success', 'Payment verified.', $record);
+            verify_response(true, 'success', 'Payment verified. Only enabled verification rules were applied.', $record, ['checks' => $matches]);
         }
         if ($wait === 0 || microtime(true) >= $deadline) break;
         $remaining = max(0.0, $deadline - microtime(true));
@@ -794,6 +798,9 @@ function handle_api(): void {
     $route = current_route(); $method = strtoupper((string)($_SERVER['REQUEST_METHOD'] ?? 'GET'));
     if ($route === 'healthz' && $method === 'GET') json_out(200, ['ok' => true, 'service' => 'Payment Gateway', 'time' => time()]);
     if ($route === 'api/app/latest' && $method === 'GET') {
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        header('Pragma: no-cache');
+        header('Expires: 0');
         try {
             $release = fb_get('app_release/current');
             if (!is_array($release) || empty($release['version_code']) || (array_key_exists('enabled', $release) && empty($release['enabled']))) {
@@ -832,10 +839,12 @@ function handle_api(): void {
             $digest = hash_init('sha256');
             $totalBytes = 0;
             $chunkCount = (int)($release['chunk_count'] ?? 0);
+            $storagePath = (string)($release['storage_path'] ?? ('app_release/apk/' . $versionCode));
+            if (!preg_match('#^app_release/apk/[A-Za-z0-9_-]+$#', $storagePath)) throw new RuntimeException('Published APK storage path is invalid.');
             if ($chunkCount > 0) {
                 if ($chunkCount > 32) throw new RuntimeException('Published APK chunk metadata is invalid.');
                 for ($chunkNo = 0; $chunkNo < $chunkCount; $chunkNo++) {
-                    $chunkResponse = fb_request('GET', 'app_release/apk/' . $versionCode . '/chunks/' . $chunkNo, null, [], [], 45.0);
+                    $chunkResponse = fb_request('GET', $storagePath . '/chunks/' . $chunkNo, null, [], [], 45.0);
                     if ($chunkResponse['code'] < 200 || $chunkResponse['code'] >= 300 || !is_string($chunkResponse['json'])) throw new RuntimeException('Published APK chunk ' . $chunkNo . ' is unavailable.');
                     $piece = base64_decode($chunkResponse['json'], true);
                     if (!is_string($piece) || strlen($piece) < 1) throw new RuntimeException('Published APK chunk ' . $chunkNo . ' is invalid.');
@@ -847,7 +856,7 @@ function handle_api(): void {
                 }
             } else {
                 // Backward compatibility for small legacy releases created before chunked storage.
-                $legacyResponse = fb_request('GET', 'app_release/apk/' . $versionCode . '/apk_base64', null, [], [], 90.0);
+                $legacyResponse = fb_request('GET', $storagePath . '/apk_base64', null, [], [], 90.0);
                 if ($legacyResponse['code'] < 200 || $legacyResponse['code'] >= 300 || !is_string($legacyResponse['json'])) throw new RuntimeException('Published APK data is unavailable.');
                 $legacyBytes = base64_decode($legacyResponse['json'], true);
                 if (!is_string($legacyBytes)) throw new RuntimeException('Published APK data is invalid.');
@@ -1017,6 +1026,122 @@ function maybe_run_data_cleanup(): void {
     }
 }
 
+
+function apk_u16(string $data, int $offset): int {
+    if ($offset < 0 || $offset + 2 > strlen($data)) throw new RuntimeException('APK manifest contains a truncated 16-bit field.');
+    return (int)unpack('v', substr($data, $offset, 2))[1];
+}
+function apk_u32(string $data, int $offset): int {
+    if ($offset < 0 || $offset + 4 > strlen($data)) throw new RuntimeException('APK manifest contains a truncated 32-bit field.');
+    return (int)unpack('V', substr($data, $offset, 4))[1];
+}
+function apk_length8(string $data, int &$offset): int {
+    if ($offset >= strlen($data)) throw new RuntimeException('APK manifest string length is truncated.');
+    $first = ord($data[$offset++]);
+    if (($first & 0x80) === 0) return $first;
+    if ($offset >= strlen($data)) throw new RuntimeException('APK manifest string length is truncated.');
+    return (($first & 0x7f) << 8) | ord($data[$offset++]);
+}
+function apk_length16(string $data, int &$offset): int {
+    $first = apk_u16($data, $offset); $offset += 2;
+    if (($first & 0x8000) === 0) return $first;
+    $second = apk_u16($data, $offset); $offset += 2;
+    return (($first & 0x7fff) << 16) | $second;
+}
+function apk_manifest_strings(string $xml, int $chunkOffset, int $headerSize, int $chunkSize): array {
+    $count = apk_u32($xml, $chunkOffset + 8);
+    $flags = apk_u32($xml, $chunkOffset + 16);
+    $stringsStart = apk_u32($xml, $chunkOffset + 20);
+    if ($count > 20000 || $headerSize < 28 || $chunkSize < $headerSize || $stringsStart >= $chunkSize) throw new RuntimeException('APK manifest string table is invalid.');
+    $utf8 = (($flags & 0x100) !== 0);
+    $strings = [];
+    for ($i = 0; $i < $count; $i++) {
+        $relative = apk_u32($xml, $chunkOffset + $headerSize + ($i * 4));
+        $pos = $chunkOffset + $stringsStart + $relative;
+        if ($pos < $chunkOffset || $pos >= $chunkOffset + $chunkSize) throw new RuntimeException('APK manifest string offset is invalid.');
+        if ($utf8) {
+            apk_length8($xml, $pos); // UTF-16 character count
+            $byteLength = apk_length8($xml, $pos);
+            if ($pos + $byteLength > $chunkOffset + $chunkSize) throw new RuntimeException('APK manifest UTF-8 string is truncated.');
+            $value = substr($xml, $pos, $byteLength);
+        } else {
+            $unitLength = apk_length16($xml, $pos);
+            $byteLength = $unitLength * 2;
+            if ($pos + $byteLength > $chunkOffset + $chunkSize) throw new RuntimeException('APK manifest UTF-16 string is truncated.');
+            $raw = substr($xml, $pos, $byteLength);
+            $value = function_exists('mb_convert_encoding') ? mb_convert_encoding($raw, 'UTF-8', 'UTF-16LE') : (iconv('UTF-16LE', 'UTF-8//IGNORE', $raw) ?: '');
+        }
+        $strings[$i] = $value;
+    }
+    return $strings;
+}
+function apk_manifest_info(string $apkPath): array {
+    if (!class_exists('ZipArchive')) throw new RuntimeException('PHP ZIP extension is not enabled on the server.');
+    $zip = new ZipArchive();
+    if ($zip->open($apkPath) !== true) throw new RuntimeException('Uploaded file is not a valid APK/ZIP archive.');
+    try {
+        $xml = $zip->getFromName('AndroidManifest.xml');
+    } finally { $zip->close(); }
+    if (!is_string($xml) || strlen($xml) < 8) throw new RuntimeException('APK AndroidManifest.xml is missing or invalid.');
+    if (substr($xml, 0, 2) === '<?') {
+        if (!preg_match('/<manifest\\b([^>]*)>/s', $xml, $root)) throw new RuntimeException('APK manifest root element is invalid.');
+        $attrs = $root[1];
+        preg_match('/\\bpackage\\s*=\\s*["\\\']([^"\\\']+)["\\\']/', $attrs, $pkg);
+        preg_match('/\\bandroid:versionCode\\s*=\\s*["\\\']([0-9]+)["\\\']/', $attrs, $vc);
+        preg_match('/\\bandroid:versionName\\s*=\\s*["\\\']([^"\\\']*)["\\\']/', $attrs, $vn);
+        return ['package'=>(string)($pkg[1]??''),'version_code'=>(int)($vc[1]??0),'version_name'=>(string)($vn[1]??'')];
+    }
+    $xmlType = apk_u16($xml, 0);
+    if ($xmlType !== 0x0003) throw new RuntimeException('APK binary Android manifest header is invalid.');
+    $total = apk_u32($xml, 4);
+    if ($total > strlen($xml) || $total < 8) throw new RuntimeException('APK Android manifest size is invalid.');
+    $strings = []; $info = ['package'=>'','version_code'=>0,'version_code_major'=>0,'version_name'=>''];
+    $offset = 8;
+    while ($offset + 8 <= $total) {
+        $type = apk_u16($xml, $offset); $headerSize = apk_u16($xml, $offset + 2); $chunkSize = apk_u32($xml, $offset + 4);
+        if ($chunkSize < 8 || $offset + $chunkSize > $total) throw new RuntimeException('APK Android manifest chunk is malformed.');
+        if ($type === 0x0001) {
+            $strings = apk_manifest_strings($xml, $offset, $headerSize, $chunkSize);
+        } elseif ($type === 0x0102 && count($strings) > 0 && $headerSize >= 16) {
+            $ext = $offset + $headerSize;
+            if ($ext + 20 <= $offset + $chunkSize) {
+                $nameIndex = apk_u32($xml, $ext + 4);
+                $tagName = $strings[$nameIndex] ?? '';
+                if ($tagName === 'manifest') {
+                    $attributeStart = apk_u16($xml, $ext + 8);
+                    $attributeSize = apk_u16($xml, $ext + 10);
+                    $attributeCount = apk_u16($xml, $ext + 12);
+                    if ($attributeSize < 20 || $attributeCount > 256) throw new RuntimeException('APK manifest attribute table is invalid.');
+                    $attrOffset = $ext + $attributeStart;
+                    for ($i=0; $i<$attributeCount; $i++) {
+                        $a = $attrOffset + ($i * $attributeSize);
+                        if ($a + 20 > $offset + $chunkSize) break;
+                        $attrNameIndex = apk_u32($xml, $a + 4);
+                        $attrName = $strings[$attrNameIndex] ?? '';
+                        $rawIndex = apk_u32($xml, $a + 8);
+                        $dataType = ord($xml[$a + 15]);
+                        $data = apk_u32($xml, $a + 16);
+                        $rawValue = $rawIndex === 0xffffffff ? null : ($strings[$rawIndex] ?? null);
+                        $value = $rawValue;
+                        if ($value === null && $dataType === 0x03) $value = $strings[$data] ?? '';
+                        if ($attrName === 'package') $info['package'] = (string)$value;
+                        elseif ($attrName === 'versionCode') $info['version_code'] = $dataType === 0x10 || $dataType === 0x11 ? $data : (int)$value;
+                        elseif ($attrName === 'versionCodeMajor') $info['version_code_major'] = $dataType === 0x10 || $dataType === 0x11 ? $data : (int)$value;
+                        elseif ($attrName === 'versionName') $info['version_name'] = (string)($value ?? '');
+                    }
+                }
+            }
+        }
+        $offset += $chunkSize;
+    }
+    $code = (int)$info['version_code'];
+    $major = (int)$info['version_code_major'];
+    if ($major > 0) $code = ($major * 4294967296) + $code;
+    $info['version_code'] = $code;
+    if ($info['package'] === '' || $code < 1) throw new RuntimeException('Could not read package name and Version Code from APK AndroidManifest.xml.');
+    return $info;
+}
+
 function admin_page(): void {
     start_admin_session();
     $flash = (string)($_SESSION['flash'] ?? ''); $newAppKey = (string)($_SESSION['new_app_key'] ?? ''); $newVerifyKey = (string)($_SESSION['new_verify_key'] ?? '');
@@ -1036,32 +1161,43 @@ function admin_page(): void {
         if (empty($_SESSION['admin']) || !hash_equals((string)$_SESSION['csrf'], (string)($_POST['csrf'] ?? ''))) { http_response_code(403); exit('Forbidden'); }
         try {
             if ($action === 'publish_app_update') {
-                if (!isset($_FILES['apk']) || !is_array($_FILES['apk']) || (int)($_FILES['apk']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) throw new RuntimeException('Select a valid APK file and upload it again.');
+                if (!isset($_FILES['apk']) || !is_array($_FILES['apk'])) throw new RuntimeException('Select an APK file first.');
+                $uploadError = (int)($_FILES['apk']['error'] ?? UPLOAD_ERR_NO_FILE);
+                if ($uploadError !== UPLOAD_ERR_OK) {
+                    $uploadMessages = [UPLOAD_ERR_INI_SIZE=>'The APK exceeds the server upload_max_filesize setting.', UPLOAD_ERR_FORM_SIZE=>'The APK exceeds the form upload size limit.', UPLOAD_ERR_PARTIAL=>'The APK upload was interrupted. Retry on a stable network.', UPLOAD_ERR_NO_FILE=>'Select an APK file first.', UPLOAD_ERR_NO_TMP_DIR=>'The server temporary upload directory is unavailable.', UPLOAD_ERR_CANT_WRITE=>'The server could not write the temporary APK file.', UPLOAD_ERR_EXTENSION=>'A server extension stopped this APK upload.'];
+                    throw new RuntimeException($uploadMessages[$uploadError] ?? 'APK upload failed with PHP upload error ' . $uploadError . '.');
+                }
                 $tmp = (string)($_FILES['apk']['tmp_name'] ?? ''); $size = (int)($_FILES['apk']['size'] ?? 0);
                 if (!is_uploaded_file($tmp) || $size < 1000 || $size > 32 * 1024 * 1024) throw new RuntimeException('APK must be between 1 KB and 32 MB. Files of 22 MB or larger are supported.');
-                $versionCode = filter_var($_POST['version_code'] ?? null, FILTER_VALIDATE_INT);
+                $apkInfo = apk_manifest_info($tmp);
+                if (strtolower((string)$apkInfo['package']) !== 'com.payment.bridge') throw new RuntimeException('Wrong package name: uploaded APK must use com.payment.bridge.');
+                $versionCode = (int)$apkInfo['version_code'];
+                if ($versionCode < 1) throw new RuntimeException('APK AndroidManifest does not contain a valid Version Code.');
                 $highest = (int)(fb_get('app_release/highest_version_code')['value'] ?? 0);
                 $currentRelease = fb_get('app_release/current');
                 $highest = max($highest, (int)($currentRelease['version_code'] ?? 0));
-                if (!$versionCode || $versionCode < 1 || $versionCode <= $highest) throw new RuntimeException('Version Code must be greater than every version previously published.');
                 if (!class_exists('ZipArchive')) throw new RuntimeException('ZIP validation is unavailable on the server. Enable PHP zip extension and redeploy.');
                 $zip = new ZipArchive();
                 if ($zip->open($tmp) !== true) throw new RuntimeException('Uploaded APK is not a valid ZIP archive.');
-                $hasManifest = $zip->locateName('AndroidManifest.xml') !== false;
                 $hasDex = false;
                 for ($zi = 0; $zi < $zip->numFiles; $zi++) { $entry = (string)$zip->getNameIndex($zi); if (preg_match('#^classes(?:[0-9]+)?\.dex$#', $entry)) { $hasDex = true; break; } }
                 $zip->close();
-                if (!$hasManifest || !$hasDex) throw new RuntimeException('This file does not contain an Android APK manifest and DEX code.');
+                if (!$hasDex) throw new RuntimeException('This file does not contain Android DEX code and is not a valid installable APK.');
                 $versionName = trim((string)($_POST['version_name'] ?? ''));
-                if ($versionName === '' || strlen($versionName) > 32) throw new RuntimeException('Version Name is required (maximum 32 characters).');
-                $notes = trim((string)($_POST['release_notes'] ?? ''));
+                if ($versionName === '') $versionName = (string)($apkInfo['version_name'] ?? '');
+                if ($versionName === '') $versionName = 'Version ' . $versionCode;
+                if (strlen($versionName) > 32) throw new RuntimeException('Version Name is limited to 32 characters.');
+                $previousRelease = fb_get('app_release/releases/' . $versionCode);
+                $previousStoragePath = is_array($previousRelease) ? (string)($previousRelease['storage_path'] ?? ('app_release/apk/' . $versionCode)) : '';
+                                $notes = trim((string)($_POST['release_notes'] ?? ''));
                 if (strlen($notes) > 1200) throw new RuntimeException('Release notes are limited to 1,200 characters.');
                 $minSupported = max(0, (int)($_POST['min_supported_version'] ?? 0));
                 $chunkSize = 4 * 1024 * 1024; // Base64 string remains safely below Firebase RTDB's 10 MB string cap.
                 $chunkCount = (int)ceil($size / $chunkSize);
                 $shaContext = hash_init('sha256');
                 $totalRead = 0;
-                $chunkPath = 'app_release/apk/' . (int)$versionCode . '/chunks';
+                $storagePath = 'app_release/apk/' . (int)$versionCode . '_' . bin2hex(random_bytes(6));
+                $chunkPath = $storagePath . '/chunks';
                 $input = fopen($tmp, 'rb');
                 if (!$input) throw new RuntimeException('Cannot open uploaded APK for chunked storage.');
                 try {
@@ -1080,21 +1216,22 @@ function admin_page(): void {
                     }
                 } catch (Throwable $chunkError) {
                     fclose($input);
-                    try { fb_delete('app_release/apk/' . (int)$versionCode); } catch (Throwable $ignored) {}
+                    try { fb_delete($storagePath); } catch (Throwable $ignored) {}
                     throw $chunkError;
                 }
                 fclose($input);
                 $sha = hash_final($shaContext);
                 if ($totalRead !== $size) {
-                    try { fb_delete('app_release/apk/' . (int)$versionCode); } catch (Throwable $ignored) {}
+                    try { fb_delete($storagePath); } catch (Throwable $ignored) {}
                     throw new RuntimeException('APK size changed while it was being stored. The release was not published.');
                 }
-                $meta = ['version_code'=>(int)$versionCode,'version_name'=>$versionName,'release_notes'=>$notes,'min_supported_version'=>$minSupported,'size_bytes'=>$size,'sha256'=>$sha,'chunk_size'=>$chunkSize,'chunk_count'=>$chunkCount,'published_at'=>time(),'published_by'=>'admin','enabled'=>true];
-                fb_write('PUT', 'app_release/apk/' . (int)$versionCode . '/meta', ['sha256'=>$sha,'size_bytes'=>$size,'chunk_size'=>$chunkSize,'chunk_count'=>$chunkCount]);
+                $meta = ['version_code'=>(int)$versionCode,'version_name'=>$versionName,'release_notes'=>$notes,'min_supported_version'=>$minSupported,'size_bytes'=>$size,'sha256'=>$sha,'chunk_size'=>$chunkSize,'chunk_count'=>$chunkCount,'storage_path'=>$storagePath,'published_at'=>time(),'published_by'=>'admin','enabled'=>true];
+                fb_write('PUT', $storagePath . '/meta', ['version_code'=>(int)$versionCode,'sha256'=>$sha,'size_bytes'=>$size,'chunk_size'=>$chunkSize,'chunk_count'=>$chunkCount]);
                 fb_write('PUT', 'app_release/releases/' . (int)$versionCode, $meta);
-                fb_write('PUT', 'app_release/highest_version_code', ['value'=>(int)$versionCode]);
+                fb_write('PUT', 'app_release/highest_version_code', ['value'=>(int)max($highest, $versionCode)]);
                 fb_write('PUT', 'app_release/current', $meta);
-                $_SESSION['flash'] = 'APK upload verified successfully (all Firebase chunks, SHA-256 and total size matched). Version Code ' . (int)$versionCode . ' is now published.';
+                if ($previousStoragePath !== '' && $previousStoragePath !== $storagePath && preg_match('#^app_release/apk/[A-Za-z0-9_-]+$#', $previousStoragePath)) { try { fb_delete($previousStoragePath); } catch (Throwable $ignored) {} }
+                $_SESSION['flash'] = 'APK upload verified successfully. Package com.payment.bridge, manifest Version Code ' . (int)$versionCode . ', all Firebase chunks, SHA-256 and file size matched. The version you just uploaded is now the current update target.';
             } elseif ($action === 'delete_app_release') {
                 $versionCode = filter_var($_POST['version_code'] ?? null, FILTER_VALIDATE_INT);
                 if (!$versionCode || $versionCode < 1) throw new RuntimeException('Invalid app release version.');
@@ -1105,8 +1242,9 @@ function admin_page(): void {
                     fb_write('PATCH', 'app_release/current', ['enabled'=>false,'disabled_at'=>time()]);
                 }
                 fb_write('PUT', 'app_release/releases/' . (int)$versionCode, $meta);
-                fb_delete('app_release/apk/' . (int)$versionCode);
-                $_SESSION['flash'] = 'Version Code ' . (int)$versionCode . ' APK deleted from Firebase. Highest Version Code remains reserved so future updates must increase. ';
+                $deletePath = (string)($meta['storage_path'] ?? ('app_release/apk/' . (int)$versionCode));
+                if (preg_match('#^app_release/apk/[A-Za-z0-9_-]+$#', $deletePath)) fb_delete($deletePath);
+                $_SESSION['flash'] = 'Version Code ' . (int)$versionCode . ' APK deleted from Firebase. You can upload another release when ready. ';
             } elseif ($action === 'run_cleanup') {
                 $retention = max(90, min(3650, (int)($_POST['retention_days'] ?? 365)));
                 $removed = run_data_cleanup($retention, 250);
@@ -1443,12 +1581,15 @@ function admin_page(): void {
     }
     ?><!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#080f1c"><title>Payment Bridge · Gateway</title><style>
     :root{color-scheme:dark;--bg:#070d18;--side:#0b1423;--panel:#101d30;--panel2:#14243a;--line:#263a55;--text:#edf5ff;--muted:#91a4bf;--mint:#2bd5a1;--blue:#5792ff;--amber:#f1bd62;--red:#fa7180;--shadow:0 18px 46px #0005}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% -10%,#183153 0,transparent 35%),var(--bg);color:var(--text);font:14px Inter,system-ui,Arial}.shell{display:grid;grid-template-columns:238px minmax(0,1fr);min-height:100vh}.side{background:#091321;border-right:1px solid var(--line);padding:23px 14px;position:sticky;top:0;height:100vh}.brand{display:flex;align-items:center;gap:11px;padding:4px 9px 25px}.logo{width:39px;height:39px;border-radius:13px;background:linear-gradient(135deg,#27d5a0,#168fbd);display:grid;place-items:center;color:#03251b;font-weight:1000;font-size:17px}.brand strong{display:block;font-size:15px;letter-spacing:.5px}.brand small{color:var(--muted);font-size:10px;letter-spacing:1.6px}.nav a{display:flex;gap:11px;align-items:center;padding:12px 13px;color:#a9bad0;text-decoration:none;border-radius:11px;margin:4px 0;font-weight:650}.nav a.active,.nav a:hover{background:#142840;color:#eaf5ff}.nav .ico{width:20px;text-align:center;color:var(--mint)}.sidebottom{position:absolute;bottom:20px;left:14px;right:14px;color:var(--muted);font-size:11px;border-top:1px solid var(--line);padding:15px 8px}.main{min-width:0;padding:24px clamp(14px,3vw,38px) 60px;max-width:1600px;width:100%;margin:auto}.top{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-bottom:22px}.eyebrow{color:var(--mint);font-size:10px;letter-spacing:2px;font-weight:800}.top h1{font-size:26px;margin:4px 0}.sub{color:var(--muted);font-size:12px}.topright{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.badge{display:inline-flex;align-items:center;padding:5px 9px;border-radius:30px;font-size:10px;font-weight:850;letter-spacing:.5px;background:#203047;color:#c6d7ec}.badge.good{background:#103b32;color:#6ce7c1}.badge.bad{background:#48242d;color:#ffadb6}.badge.warn{background:#45351e;color:#ffd78c}.panel{background:linear-gradient(180deg,#122139,#0e1a2c);border:1px solid var(--line);border-radius:17px;box-shadow:var(--shadow);padding:18px;margin-bottom:16px}.panelhead{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:15px}.panel h2{font-size:15px;margin:0}.panel p{color:var(--muted);font-size:12px;line-height:1.6}.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:13px;margin-bottom:16px}.stat{background:linear-gradient(145deg,#142640,#0e1b2d);border:1px solid var(--line);padding:17px;border-radius:15px;min-width:0}.stat .label{color:var(--muted);font-size:11px}.stat .value{font-weight:850;font-size:clamp(18px,2.1vw,25px);margin:8px 0 4px;overflow-wrap:anywhere}.stat .hint{font-size:10px;color:var(--muted)}.mint{color:var(--mint)}.blue{color:#88b5ff}.amber{color:var(--amber)}.red{color:var(--red)}.row{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.row form{margin:0}.grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}label{display:block;color:#a9bad0;font-size:11px;margin:9px 0 5px}input,select,button,.btn{font:inherit;border:1px solid #304663;border-radius:10px;padding:10px 11px;background:#0a1627;color:var(--text);width:100%;min-width:0}input[type=checkbox]{width:auto;accent-color:var(--mint);margin-right:7px}button,.btn{background:linear-gradient(135deg,#25c99a,#159b88);color:#03251d;border:0;font-weight:850;cursor:pointer;text-decoration:none;text-align:center;display:inline-block}button.secondary,.btn.secondary{background:#263b57;color:#e6f1ff}button.danger{background:#7c2f3d;color:#fff}button.small{width:auto;padding:7px 10px;font-size:11px}.tablewrap{overflow:auto;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:720px;font-size:12px}th,td{text-align:left;padding:11px 12px;border-bottom:1px solid #24364e;white-space:nowrap}.message-cell{white-space:normal;min-width:260px;max-width:460px;overflow-wrap:anywhere;word-break:break-word;line-height:1.5}.message-cell summary{cursor:pointer;white-space:normal;overflow-wrap:anywhere;max-width:430px}.full-message{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;max-width:460px;padding:9px;margin-top:7px;border:1px solid var(--line);border-radius:8px;background:#081526}.wrap-cell{white-space:normal;overflow-wrap:anywhere;word-break:break-word;max-width:220px}.sub{overflow-wrap:anywhere}th{background:#14243a;color:#9db1ca;font-size:10px;text-transform:uppercase;letter-spacing:.7px}tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.keybox{font:800 14px ui-monospace,monospace;overflow-wrap:anywhere;word-break:break-word;background:#071321;border:1px dashed #318f79;padding:13px;border-radius:10px;margin:10px 0}.notice{overflow-wrap:anywhere;word-break:break-word;border:1px solid #267d68;background:#0d302b;color:#b8ffe9;padding:13px;border-radius:12px;margin-bottom:15px}.warning{border-color:#735629;background:#332817;color:#ffe2a9}.sectionnote{font-size:11px;color:var(--muted);line-height:1.6}.barrow{display:grid;grid-template-columns:78px 1fr 90px;gap:10px;align-items:center;margin:10px 0;font-size:11px;color:var(--muted)}.bar{height:8px;background:#1b2b42;border-radius:10px;overflow:hidden}.bar i{height:100%;display:block;background:linear-gradient(90deg,#21bd9a,#5f9dff);border-radius:10px}.filter{display:grid;grid-template-columns:2fr 1fr 1fr auto;gap:9px;align-items:end;margin-bottom:14px}.inlineform{display:flex;gap:7px;align-items:center;flex-wrap:wrap}.inlineform select{width:auto;min-width:110px}.inlineform button{width:auto}.checkgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.checkitem{padding:12px;border:1px solid var(--line);border-radius:11px;background:#0b1728}.checkitem label{margin:0;color:var(--text);font-size:12px}.topmobile{display:none}.empty{padding:27px;text-align:center;color:var(--muted)}@media(max-width:1000px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.shell{grid-template-columns:205px minmax(0,1fr)}}@media(max-width:720px){.shell{display:block}.side{position:relative;width:auto;height:auto;padding:10px;border-right:0;border-bottom:1px solid var(--line)}.brand{padding:5px 8px 12px}.nav{display:flex;overflow:auto;gap:4px;padding-bottom:3px}.nav a{white-space:nowrap;margin:0;padding:10px;font-size:11px}.sidebottom{display:none}.main{padding-top:18px}.top{align-items:flex-start;flex-direction:column}.stats{gap:8px}.stat{padding:13px}.grid2,.grid3{grid-template-columns:1fr}.filter{grid-template-columns:1fr 1fr}.filter .wide{grid-column:1/-1}.checkgrid{grid-template-columns:1fr}}@media(max-width:390px){.stats{grid-template-columns:1fr 1fr}.stat .value{font-size:18px}}
-    </style></head><body><div class="shell"><aside class="side"><div class="brand"><div class="logo">PB</div><div><strong>PAYMENT GATEWAY</strong><small>PERSONAL GATEWAY</small></div></div><nav class="nav"><?php foreach ($tabs as $id=>$label): $icons=['overview'=>'◫','sim'=>'▤','transactions'=>'⌕','unverified'=>'◷','monitor'=>'⌁','duplicates'=>'≋','sms'=>'▣','api'=>'⌘','devices'=>'▦','data'=>'◈','updates'=>'⇧','settings'=>'⚙']; ?><a class="<?= $tab===$id?'active':'' ?>" href="/admin?tab=<?=h($id)?>&amp;month=<?=h($month)?>&amp;period=<?=h($period)?>&amp;year=<?=h((string)$reportYear)?>"><span class="ico"><?=$icons[$id]?></span><?=h($label)?></a><?php endforeach; ?></nav><div class="sidebottom">Firebase RTDB<br>Single Firebase RTDB</div></aside><main class="main"><header class="top"><div><div class="eyebrow">PAYMENT OPERATIONS / BD</div><h1><?=h($tabs[$tab])?></h1><div class="sub">Selected period: <?=h($periodLabel)?> · Asia/Dhaka<?php if($renderExternalUrl!==''): ?> · Service URL: <?=h($renderExternalUrl)?><?php endif; ?></div></div><div class="topright"><a class="btn secondary small" href="/api/health" target="_blank" rel="noopener">API HEALTH</a><?=$badge(config_ready()?'BACKEND READY':'CONFIG REQUIRED',config_ready())?><form method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><button class="secondary small">Sign out</button></form></div></header>
+    </style></head><body><div class="shell"><aside class="side"><div class="brand"><div class="logo">PB</div><div><strong>PAYMENT GATEWAY</strong><small>PERSONAL GATEWAY</small></div></div><nav class="nav"><?php foreach ($tabs as $id=>$label): $icons=['overview'=>'◫','sim'=>'▤','transactions'=>'⌕','unverified'=>'◷','monitor'=>'⌁','duplicates'=>'≋','sms'=>'▣','api'=>'⌘','devices'=>'▦','data'=>'◈','updates'=>'⇧','settings'=>'⚙']; ?><a class="<?= $tab===$id?'active':'' ?>" href="/admin?tab=<?=h($id)?>&amp;month=<?=h($month)?>&amp;period=<?=h($period)?>&amp;year=<?=h((string)$reportYear)?>"><span class="ico"><?=$icons[$id]?></span><?=h($label)?></a><?php endforeach; ?></nav><div class="sidebottom">Firebase RTDB<br>Single Firebase RTDB</div></aside><main class="main"><header class="top"><div><div class="eyebrow">PAYMENT OPERATIONS / BD</div><h1><?=h($tabs[$tab])?></h1><div class="sub"><?php if(in_array($tab,['overview','sim','transactions','monitor'],true)): ?>Selected period: <?=h($periodLabel)?> · Asia/Dhaka<?php endif; ?><?php if($renderExternalUrl!==''): ?> · Service URL: <?=h($renderExternalUrl)?><?php endif; ?></div></div><div class="topright"><a class="btn secondary small" href="/api/health" target="_blank" rel="noopener">API HEALTH</a><?=$badge(config_ready()?'BACKEND READY':'CONFIG REQUIRED',config_ready())?><form method="post"><input type="hidden" name="action" value="logout"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><button class="secondary small">Sign out</button></form></div></header>
     <?php if ($flash !== ''): ?><div class="notice"><?=h($flash)?></div><?php endif; ?>
     <?php if ($newAppKey !== ''): ?><div class="notice"><b>New App Upload Key — copy now</b><div class="keybox" id="freshappkey"><?=h($newAppKey)?></div><button class="small" onclick="navigator.clipboard.writeText(document.getElementById('freshappkey').innerText)">Copy key</button><p>One key may be entered on many phones. The full key is shown once.</p></div><?php endif; ?>
     <?php if ($newVerifyKey !== ''): ?><div class="notice"><b>New Verification API Key — copy now</b><div class="keybox" id="freshverifykey"><?=h($newVerifyKey)?></div><button class="small" onclick="navigator.clipboard.writeText(document.getElementById('freshverifykey').innerText)">Copy key</button><p>Use this key from server-side website code or Telegram bot. Never expose it in public JavaScript.</p></div><?php endif; ?>
     <?php if ($loadError !== ''): ?><div class="notice warning"><?=h($loadError)?></div><?php endif; ?>
-    <form method="get" class="row" style="margin:0 0 16px"><input type="hidden" name="tab" value="<?=h($tab)?>"><label style="margin:0">Report period</label><select name="period" style="max-width:145px"><option value="day" <?=$period==='day'?'selected':''?>>Single day</option><option value="7d" <?=$period==='7d'?'selected':''?>>Last 7 days</option><option value="range" <?=$period==='range'?'selected':''?>>Date range</option><option value="month" <?=$period==='month'?'selected':''?>>Month</option><option value="year" <?=$period==='year'?'selected':''?>>Year</option></select><input type="date" name="date" value="<?=h($reportDate)?>" style="max-width:150px"><input type="date" name="from" value="<?=h($rangeFrom)?>" style="max-width:150px"><input type="date" name="to" value="<?=h($rangeTo)?>" style="max-width:150px"><input type="month" name="month" value="<?=h($month)?>" style="max-width:150px"><input type="number" name="year" min="2020" max="<?=date('Y')+1?>" value="<?=h((string)$reportYear)?>" style="max-width:90px"><button class="small">Apply</button><a class="btn secondary small" href="/admin?tab=transactions&amp;period=<?=h($period)?>&amp;month=<?=h($month)?>&amp;year=<?=h((string)$reportYear)?>&amp;export=transactions">Export CSV</a></form>
+    <?php if(in_array($tab,['overview','sim','transactions','monitor'],true)): ?>
+    <?php $exportParams = ['tab'=>'transactions','period'=>$period,'date'=>$reportDate,'from'=>$rangeFrom,'to'=>$rangeTo,'month'=>$month,'year'=>$reportYear,'export'=>'transactions']; ?>
+    <form method="get" id="reportPeriodForm" class="row" style="margin:0 0 16px"><input type="hidden" name="tab" value="<?=h($tab)?>"><label style="margin:0">Report period</label><select name="period" id="reportPeriodSelect" onchange="this.form.submit()" style="max-width:145px"><option value="day" <?=$period==='day'?'selected':''?>>Single day</option><option value="7d" <?=$period==='7d'?'selected':''?>>Last 7 days</option><option value="range" <?=$period==='range'?'selected':''?>>Date range</option><option value="month" <?=$period==='month'?'selected':''?>>Month</option><option value="year" <?=$period==='year'?'selected':''?>>Year</option></select><?php if($period==='day'): ?><input type="date" name="date" value="<?=h($reportDate)?>" style="max-width:160px"><?php elseif($period==='range'): ?><input type="date" name="from" value="<?=h($rangeFrom)?>" style="max-width:160px"><input type="date" name="to" value="<?=h($rangeTo)?>" style="max-width:160px"><?php elseif($period==='month'): ?><input type="month" name="month" value="<?=h($month)?>" style="max-width:160px"><?php elseif($period==='year'): ?><input type="number" name="year" min="2020" max="<?=date('Y')+1?>" value="<?=h((string)$reportYear)?>" style="max-width:110px"><?php endif; ?><button class="small">Apply</button><?php if($tab==='transactions'): ?><a class="btn secondary small" href="/admin?<?=h(http_build_query($exportParams))?>">Export CSV</a><?php endif; ?></form>
+    <?php endif; ?>
     <?php if ($tab === 'overview'): ?>
       <div class="stats"><div class="stat"><div class="label">MONEY RECEIVED · CREDIT</div><div class="value mint"><?=h(money($incoming))?></div><div class="hint"><?=number_format($incomingCount)?> incoming transactions</div></div><div class="stat"><div class="label">MONEY SENT · DEBIT</div><div class="value amber"><?=h(money($outgoing))?></div><div class="hint"><?=number_format($outgoingCount)?> outgoing transactions</div></div><div class="stat"><div class="label">PAYMENT TXN IDS</div><div class="value blue"><?=number_format($paymentCount)?></div><div class="hint">Unique Method + Txn ID records</div></div><div class="stat"><div class="label">RECENT NOT API-CHECKED</div><div class="value red"><?=number_format(count($unverified))?></div><div class="hint">Latest 100 payment records only</div></div><div class="stat"><div class="label">API VERIFY REQUESTS</div><div class="value"><?=number_format($apiRequests)?></div><div class="hint"><?=number_format($apiSuccess)?> successful in selected period</div></div><div class="stat"><div class="label">USED / VERIFIED PAYMENTS</div><div class="value mint"><?=number_format($usedCount)?></div><div class="hint">Transactions marked used</div></div><div class="stat"><div class="label">PAYMENT SMS</div><div class="value"><?=number_format($smsCount)?></div><div class="hint">Payment notifications saved</div></div><div class="stat"><div class="label">DUPLICATE TXN</div><div class="value amber"><?=number_format($duplicateTxnCount)?></div><div class="hint">Repeated Method + Txn ID uploads</div></div><div class="stat"><div class="label">APP INSTANCES</div><div class="value"><?=number_format(count($devices))?></div><div class="hint">Installations seen by backend</div></div><div class="stat"><div class="label">API KEYS</div><div class="value"><?=number_format(count(array_filter($verifyKeys, function($v){return is_array($v)&&!empty($v['active']);})))?></div><div class="hint">Active verification keys</div></div></div>
       <div class="grid2"><section class="panel"><div class="panelhead"><h2>Money flow</h2><span class="badge good"><?=h($periodLabel)?></span></div><div class="barrow"><span>Received</span><div class="bar"><i style="width:<?=($incoming+$outgoing)>0?max(2,min(100,100*$incoming/($incoming+$outgoing))):0?>%"></i></div><b><?=h(money($incoming))?></b></div><div class="barrow"><span>Sent</span><div class="bar"><i style="width:<?=($incoming+$outgoing)>0?max(2,min(100,100*$outgoing/($incoming+$outgoing))):0?>%;background:linear-gradient(90deg,#e8ac50,#e46d75)"></i></div><b><?=h(money($outgoing))?></b></div><p>Incoming is counted from SMS parsed as <b>credit</b>; outgoing is counted from <b>debit</b>. Unknown direction is not included in money-flow totals.</p></section><section class="panel"><div class="panelhead"><h2>Payment follow-up</h2><span class="badge warn">Action needed</span></div><p><b class="red"><?=count($unverified)?></b> payments have arrived but no verification request has been matched to their Txn ID (including requests received before SMS sync).</p><p><b><?=number_format($apiPending)?></b> pending now · <b><?=number_format($apiNotFound)?></b> not found · <b><?=number_format($apiFailure)?></b> other failures · <b><?=number_format($apiMetrics['result_duplicate'] ?? 0)?></b> duplicate results.</p><a class="btn secondary" href="/admin?tab=unverified&amp;period=<?=h($period)?>&amp;month=<?=h($month)?>&amp;year=<?=h((string)$reportYear)?>">Review unchecked payments</a></section></div>
@@ -1480,8 +1621,8 @@ function admin_page(): void {
     <?php elseif ($tab === 'devices'): ?>
       <section class="panel"><div class="panelhead"><h2>Connected Android installations</h2><span class="badge"><?=count($devices)?> total · <?=$devicesNeedAttention?> need attention</span></div><p>এক নজরে permission, heartbeat ও pending queue health। বর্তমানে মোট <?=$pendingQueueTotal?>টি payment SMS device queue-তে pending আছে। কোনো device key binding বা signer SHA-256 নেই; একই App Upload Key একাধিক device-এ ব্যবহার করা যায়।</p><div class="tablewrap"><table><thead><tr><th>Installation ID</th><th>Label</th><th>Model</th><th>Status</th><th>Last Login</th><th>Last Connect</th><th>Last Heartbeat</th><th>App Version</th><th>Android SDK</th><th>SMS</th><th>Notifications</th><th>Battery</th><th>Background</th><th>Network</th><th>Pending Queue</th><th>Control</th></tr></thead><tbody><?php foreach($devices as $id=>$d):if(!is_array($d))continue;?><tr><td><?=h(substr((string)$id,0,18))?>…</td><td><?=h((string)($d['label']??''))?></td><td><?=h((string)($d['model']??''))?></td><td><?php $heartbeatAge = time() - (int)($d['last_heartbeat_at'] ?? 0); $deviceState = !empty($d['blocked']) ? 'BLOCKED' : ($heartbeatAge <= 180 && !empty($d['network_connected']) ? 'ONLINE' : ($heartbeatAge <= 600 ? 'SYNC ISSUE' : 'OFFLINE')); ?><?=$badge($deviceState,$deviceState==='ONLINE')?></td><td><?=!empty($d['last_login_at'])?h(date('d/m/Y H:i',(int)$d['last_login_at'])):'-'?></td><td><?=!empty($d['last_connect_at'])?h(date('d/m/Y H:i',(int)$d['last_connect_at'])):'-'?></td><td><?=!empty($d['last_heartbeat_at'])?h(date('d/m/Y H:i',(int)$d['last_heartbeat_at'])):'-'?></td><td><?=h((string)($d['app_version']??'-'))?></td><td><?=!empty($d['android_sdk'])?h((string)$d['android_sdk']):'-'?></td><td><?=$badge(array_key_exists('permission_sms',$d)?(!empty($d['permission_sms'])?'GRANTED':'MISSING'):'UNKNOWN',array_key_exists('permission_sms',$d)&&!empty($d['permission_sms']))?></td><td><?=$badge(array_key_exists('permission_notifications',$d)?(!empty($d['permission_notifications'])?'ALLOWED':'BLOCKED'):'UNKNOWN',array_key_exists('permission_notifications',$d)&&!empty($d['permission_notifications']))?></td><td><?=$badge(array_key_exists('permission_battery_exempt',$d)?(!empty($d['permission_battery_exempt'])?'EXEMPT':'OPTIMIZED'):'UNKNOWN',array_key_exists('permission_battery_exempt',$d)&&!empty($d['permission_battery_exempt']))?></td><td><?=$badge(array_key_exists('background_restricted',$d)?(!empty($d['background_restricted'])?'RESTRICTED':'OK'):'UNKNOWN',array_key_exists('background_restricted',$d)&&empty($d['background_restricted']))?></td><td><?=$badge(array_key_exists('network_connected',$d)?(!empty($d['network_connected'])?'ONLINE':'OFFLINE'):'UNKNOWN',array_key_exists('network_connected',$d)&&!empty($d['network_connected']))?></td><td><?=number_format((int)($d['pending_queue_count']??0))?></td><td><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="device_toggle"><input type="hidden" name="device_id" value="<?=h((string)$id)?>"><input type="hidden" name="blocked" value="<?=empty($d['blocked'])?'1':'0'?>"><button class="<?=empty($d['blocked'])?'danger':'small'?> small"><?=empty($d['blocked'])?'Block':'Unblock'?></button></form></td></tr><?php endforeach;?></tbody></table></div></section>
     <?php elseif ($tab === 'updates'): ?>
-      <section class="panel"><div class="panelhead"><h2>Publish Android App Update</h2><span class="badge good">APK update channel</span></div><p>Signed APK upload করলে app-এর ডান পাশের ⋮ menu-তে লাল update indicator দেখাবে। Package name <code>com.payment.bridge</code> এবং আগের release-এর signing certificate একই হতে হবে; Version Code অবশ্যই প্রতিবার বাড়াতে হবে। ২২ MB বা তার চেয়ে বড় APK-ও upload করা যাবে।</p><div class="grid2"><div><div class="stat"><div class="label">CURRENT PUBLISHED VERSION</div><div class="value blue"><?=h((string)($publishedRelease['version_name']??'Not published'))?></div><div class="hint">Version Code: <?=number_format((int)($publishedRelease['version_code']??0))?> · <?=!empty($publishedRelease['enabled'])?'Enabled':'No active release'?></div></div><p>APK SHA-256: <code><?=h((string)($publishedRelease['sha256']??'—'))?></code></p><p>File size: <?=!empty($publishedRelease['size_bytes'])?h(number_format((int)$publishedRelease['size_bytes']/1048576,2).' MB'):'—'?></p><p>Last published: <?=!empty($publishedRelease['published_at'])?h(date('d/m/Y H:i',(int)$publishedRelease['published_at'])):'—'?></p><form method="post" onsubmit="return confirm('Remove the currently published APK and disable app updates? Existing installed apps will remain installed.')"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="delete_app_release"><input type="hidden" name="version_code" value="<?=h((string)($publishedRelease['version_code']??0))?>"><button class="danger" <?=empty($publishedRelease['version_code'])?'disabled':''?>>Delete current published APK</button></form></div><div><form id="appUpdateForm" method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="publish_app_update"><label>Version Code (must increase)</label><input type="number" name="version_code" min="1" value="<?=number_format(max((int)($publishedRelease['version_code']??0), (int)(fb_get('app_release/highest_version_code')['value']??0))+1,0,'','')?>" required><label>Version Name</label><input name="version_name" maxlength="32" placeholder="3.1.0" required><label>Minimum supported Version Code (0 = no minimum)</label><input type="number" name="min_supported_version" min="0" value="0"><label>Release notes</label><textarea name="release_notes" rows="3" maxlength="1200" placeholder="Bug fixes and improvements"></textarea><label>Signed APK (maximum 32 MB · 22 MB+ supported)</label><input type="file" name="apk" accept=".apk,application/vnd.android.package-archive" required><button style="margin-top:12px">Upload, Verify &amp; Publish</button><div id="apkUploadProgress" style="display:none;margin-top:14px;background:#1b2b42;border-radius:12px;overflow:hidden;height:12px"><div id="apkUploadBar" style="height:100%;width:0%;background:linear-gradient(90deg,#21bd9a,#5f9dff)"></div></div><p id="apkUploadStatus" class="sectionnote" aria-live="polite">Server validates the APK archive, stores it as small chunks in the single Firebase database (each chunk is read back), then verifies the complete SHA-256 and file size before publishing.</p></form></div></div></section>
-      <section class="panel"><div class="panelhead"><h2>Uploaded App Versions</h2><span class="badge"><?=count($publishedReleases)?> versions</span></div><div class="tablewrap"><table><thead><tr><th>Version</th><th>Code</th><th>File Size</th><th>SHA-256</th><th>Published</th><th>Status</th><th>Action</th></tr></thead><tbody><?php if(!$publishedReleases):?><tr><td colspan="7" class="empty">No version archive yet. New verified uploads will appear here.</td></tr><?php else:foreach($publishedReleases as $code=>$release):if(!is_array($release))continue;?><tr><td><?=h((string)($release['version_name']??''))?></td><td><?=number_format((int)$code)?></td><td><?=number_format((int)($release['size_bytes']??0)/1048576,2)?> MB</td><td class="wrap-cell"><?=h(substr((string)($release['sha256']??''),0,20))?>…</td><td><?=!empty($release['published_at'])?h(date('d/m/Y H:i',(int)$release['published_at'])):'—'?></td><td><?=$badge(!empty($release['enabled'])?'ACTIVE':'DELETED',!empty($release['enabled']))?></td><td><form method="post" onsubmit="return confirm('Permanently delete this APK file?')"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="delete_app_release"><input type="hidden" name="version_code" value="<?=h((string)$code)?>"><button class="danger small">Delete APK</button></form></td></tr><?php endforeach;endif;?></tbody></table></div><p class="sectionnote">A published APK can be removed and replaced. Version Code history is never reset. Do not delete the only APK that current users need until a newer APK is verified and published.</p></section>
+      <section class="panel"><div class="panelhead"><h2>Publish Android App Update</h2><span class="badge good">APK update channel</span></div><p>Signed APK upload করলে app-এর ডান পাশের ⋮ menu-তে লাল update indicator দেখাবে। Package name <code>com.payment.bridge</code> হতে হবে। APK-এর Version Code ও Version Name manifest থেকে স্বয়ংক্রিয় পড়া হবে; যেকোনো valid Version Code upload করা যাবে। ফোনে in-place update করতে Version Code installed app-এর চেয়ে বেশি এবং signing certificate একই হতে হবে। ২২ MB বা তার চেয়ে বড় APK-ও upload করা যাবে।</p><div class="grid2"><div><div class="stat"><div class="label">CURRENT PUBLISHED VERSION</div><div class="value blue"><?=h((string)($publishedRelease['version_name']??'Not published'))?></div><div class="hint">Version Code: <?=number_format((int)($publishedRelease['version_code']??0))?> · <?=!empty($publishedRelease['enabled'])?'Enabled':'No active release'?></div></div><p>APK SHA-256: <code><?=h((string)($publishedRelease['sha256']??'—'))?></code></p><p>File size: <?=!empty($publishedRelease['size_bytes'])?h(number_format((int)$publishedRelease['size_bytes']/1048576,2).' MB'):'—'?></p><p>Last published: <?=!empty($publishedRelease['published_at'])?h(date('d/m/Y H:i',(int)$publishedRelease['published_at'])):'—'?></p><form method="post" onsubmit="return confirm('Remove the currently published APK and disable app updates? Existing installed apps will remain installed.')"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="delete_app_release"><input type="hidden" name="version_code" value="<?=h((string)($publishedRelease['version_code']??0))?>"><button class="danger" <?=empty($publishedRelease['version_code'])?'disabled':''?>>Delete current published APK</button></form></div><div><form id="appUpdateForm" method="post" enctype="multipart/form-data"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="publish_app_update"><label>Version Code</label><input value="Read automatically from the APK manifest" readonly><label>Version Name (optional · APK manifest fallback)</label><input name="version_name" maxlength="32" placeholder="e.g. 3.1.2"><label>Minimum supported Version Code (0 = no minimum)</label><input type="number" name="min_supported_version" min="0" value="0"><label>Release notes</label><textarea name="release_notes" rows="3" maxlength="1200" placeholder="Bug fixes and improvements"></textarea><label>APK file (maximum 32 MB · package/version read from manifest)</label><input type="file" name="apk" accept=".apk,application/vnd.android.package-archive" required><button style="margin-top:12px">Upload, Verify &amp; Publish</button><div id="apkUploadProgress" style="display:none;margin-top:14px;background:#1b2b42;border-radius:12px;overflow:hidden;height:12px"><div id="apkUploadBar" style="height:100%;width:0%;background:linear-gradient(90deg,#21bd9a,#5f9dff)"></div></div><p id="apkUploadStatus" class="sectionnote" aria-live="polite">Server validates the APK archive, stores it as small chunks in the single Firebase database (each chunk is read back), then verifies the complete SHA-256 and file size before publishing.</p></form></div></div></section>
+      <section class="panel"><div class="panelhead"><h2>Uploaded App Versions</h2><span class="badge"><?=count($publishedReleases)?> versions</span></div><div class="tablewrap"><table><thead><tr><th>Version</th><th>Code</th><th>File Size</th><th>SHA-256</th><th>Published</th><th>Status</th><th>Action</th></tr></thead><tbody><?php if(!$publishedReleases):?><tr><td colspan="7" class="empty">No version archive yet. New verified uploads will appear here.</td></tr><?php else:foreach($publishedReleases as $code=>$release):if(!is_array($release))continue;?><tr><td><?=h((string)($release['version_name']??''))?></td><td><?=number_format((int)$code)?></td><td><?=number_format((int)($release['size_bytes']??0)/1048576,2)?> MB</td><td class="wrap-cell"><?=h(substr((string)($release['sha256']??''),0,20))?>…</td><td><?=!empty($release['published_at'])?h(date('d/m/Y H:i',(int)$release['published_at'])):'—'?></td><td><?=$badge(empty($release['enabled'])?'DELETED':((int)($publishedRelease['version_code']??0)===(int)$code?'LATEST':'ARCHIVED'),!empty($release['enabled'])&&(int)($publishedRelease['version_code']??0)===(int)$code)?></td><td><form method="post" onsubmit="return confirm('Permanently delete this APK file?')"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="delete_app_release"><input type="hidden" name="version_code" value="<?=h((string)$code)?>"><button class="danger small">Delete APK</button></form></td></tr><?php endforeach;endif;?></tbody></table></div><p class="sectionnote">Every valid com.payment.bridge APK is accepted and the most recently uploaded release becomes the current update target. Android itself only installs an in-place update when the APK Version Code is higher than the installed app and the signing certificate matches.</p></section>
       <script>(function(){var f=document.getElementById('appUpdateForm');if(!f)return;f.addEventListener('submit',function(e){e.preventDefault();var file=f.querySelector('input[type=file]').files[0];var status=document.getElementById('apkUploadStatus');var wrap=document.getElementById('apkUploadProgress');var bar=document.getElementById('apkUploadBar');if(!file){status.textContent='Select an APK file first.';return;}if(file.size>32*1024*1024){status.textContent='APK is larger than 32 MB. This server currently accepts files up to 32 MB.';return;}var xhr=new XMLHttpRequest();xhr.open('POST',location.href,true);wrap.style.display='block';status.textContent='Uploading '+(file.size/1048576).toFixed(2)+' MB…';xhr.upload.onprogress=function(ev){if(ev.lengthComputable){var pct=Math.round(ev.loaded/ev.total*100);bar.style.width=pct+'%';status.textContent='Uploading APK: '+pct+'% ('+(ev.loaded/1048576).toFixed(1)+' / '+(ev.total/1048576).toFixed(1)+' MB)';}};xhr.onload=function(){var body=xhr.responseText||'';if(xhr.status===200&&body.indexOf('APK upload verified successfully')!==-1){bar.style.width='100%';status.textContent='Upload completed. Firebase SHA-256 and file size were verified. Publishing successful.';setTimeout(function(){location.reload();},1200);}else{var plain=body.replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();var pos=plain.indexOf('Action failed:');status.textContent=pos>=0?plain.substring(pos,pos+350):'Upload was not confirmed. Check the Admin flash message and try again.';}};xhr.onerror=function(){status.textContent='Network/DNS error while uploading. The APK may not have been published; refresh Admin and verify the release list.';};xhr.send(new FormData(f));});})();</script>
     <?php elseif ($tab === 'settings'): ?>
       <div class="grid2"><section class="panel"><h2>Verification rules</h2><p>Enabled rules are ANDed together. Txn ID is used for indexed lookup even if its compare switch is turned off.</p><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="save_verification"><div class="checkgrid"><?php foreach(['verify_number'=>'Sender number','verify_amount'=>'Amount','verify_txn_id'=>'Transaction ID','verify_method'=>'Payment method'] as $field=>$label):?><div class="checkitem"><label><input type="checkbox" name="<?=$field?>" <?=!empty($verification[$field])?'checked':''?>><?=h($label)?></label></div><?php endforeach;?></div><label>Wait for SMS sync (seconds, 0–60)</label><input type="number" name="wait_seconds" min="0" max="60" value="<?=h((string)$verification['wait_seconds'])?>"><label>Firebase polling interval (ms, 150–3000)</label><input type="number" name="poll_interval_ms" min="150" max="3000" step="50" value="<?=h((string)$verification['poll_interval_ms'])?>"><label>Default API Requests / Minute (10–1200 · per-key value overrides this)</label><input type="number" name="default_rate_limit_per_min" min="10" max="1200" value="<?=h((string)($verification['default_rate_limit_per_min']??120))?>"><button style="margin-top:13px">Save verification settings</button></form></section><section class="panel"><h2>Automatic Data Cleanup</h2><p>Only old raw SMS messages and duplicate-event detail rows are eligible. Canonical payment_transactions, TxnID indexes, API keys and aggregates are never deleted.</p><?php $maintenanceSettings = []; try { $maintenanceSettings = fb_get('settings/maintenance'); } catch (Throwable $ignored) {} ?><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="run_cleanup"><label>Keep data for at least (days · minimum 90)</label><input type="number" min="90" max="3650" name="retention_days" value="<?=h((string)($maintenanceSettings['cleanup_retention_days']??365))?>"><div class="checkitem"><label><input type="checkbox" name="automatic_cleanup" <?=!array_key_exists('automatic_cleanup',$maintenanceSettings)||!empty($maintenanceSettings['automatic_cleanup'])?'checked':''?>>Enable daily automatic cleanup</label></div><button style="margin-top:10px">Save &amp; Run Cleanup</button></form></section><section class="panel"><h2>System information</h2><p>Database: One Firebase Realtime Database</p><p>Backend: Single PHP index.php</p><p>Timezone: Asia/Dhaka</p><p>Application upload keys: shared across multiple devices</p><p>Signer SHA-256: disabled</p><p>Request-by-request logs: disabled; only daily/monthly aggregate API counters are stored for reporting.</p><p>Verification API limit: admin-managed per-key rolling window, 10–1200 requests per minute; global default is also editable in Admin. API polling interval can be set to 150–3000 ms. Render Free worker/memory limits still cap concurrent long-wait API requests.</p><p>Payment records are kept by unique Method + Txn ID. Used records cannot be verified again.</p></section></div>
