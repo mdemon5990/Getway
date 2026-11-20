@@ -83,17 +83,32 @@ function firebase_token(int $slot = 1): string {
     if ($private === false) throw new RuntimeException('Firebase private key cannot be loaded.');
     $sig = '';
     if (!openssl_sign($unsigned, $sig, $private, OPENSSL_ALGO_SHA256)) throw new RuntimeException('Firebase OAuth signing failed.');
-    $ch = curl_init((string)$sa['token_uri']);
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => http_build_query(['grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion' => $unsigned . '.' . base64url($sig)]),
-        CURLOPT_RETURNTRANSFER => true, CURLOPT_CONNECTTIMEOUT => 8, CURLOPT_TIMEOUT => 15,
-        CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded'],
-        CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2
-    ]);
-    $body = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); $err = curl_error($ch); curl_close($ch);
-    $data = json_decode((string)$body, true);
-    if ($code < 200 || $code >= 300 || !is_array($data) || empty($data['access_token'])) {
+    $tokenBody = http_build_query(['grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion' => $unsigned . '.' . base64url($sig)]);
+    $tokenDeadline = microtime(true) + 10.0;
+    $data = null; $code = 0; $err = '';
+    for ($attempt = 0; $attempt < 3; $attempt++) {
+        $remaining = $tokenDeadline - microtime(true);
+        if ($remaining < 0.5) break;
+        $timeoutMs = max(500, min(4000, (int)floor(($remaining / (3 - $attempt)) * 1000)));
+        $ch = curl_init((string)$sa['token_uri']);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true, CURLOPT_POSTFIELDS => $tokenBody,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT_MS => min(2500, $timeoutMs), CURLOPT_TIMEOUT_MS => $timeoutMs,
+            CURLOPT_NOSIGNAL => true,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/x-www-form-urlencoded', 'Accept: application/json'],
+            CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2
+        ]);
+        $body = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $errno = (int)curl_errno($ch); $err = curl_error($ch); curl_close($ch);
+        $data = json_decode((string)$body, true);
+        if ($body !== false && $code >= 200 && $code < 300 && is_array($data) && !empty($data['access_token'])) break;
+        $retryable = in_array($code, [408,425,429,500,502,503,504], true) || in_array($errno, [5,6,7,18,28,35,52,55,56], true);
+        if (!$retryable || $attempt >= 2) break;
+        $backoff = min(150000 * ($attempt + 1), max(0, (int)(($tokenDeadline - microtime(true)) * 1000000)));
+        if ($backoff > 0) usleep($backoff);
+    }
+    if (!is_array($data) || empty($data['access_token'])) {
         throw new RuntimeException('Firebase server authentication failed (HTTP ' . $code . '). ' . $err);
     }
     $token = (string)$data['access_token']; $expiry = $now + (int)($data['expires_in'] ?? 3500);
@@ -109,31 +124,71 @@ function fb_request_target(int $slot, string $method, string $path, $payload = n
     if ($query) $url .= '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
     $headers = array_merge(['Authorization: Bearer ' . firebase_token(1), 'Accept: application/json'], $extraHeaders);
     if ($payload !== null) $headers[] = 'Content-Type: application/json';
-    $timeoutMs = max(150, min(180000, (int)ceil($timeoutSeconds * 1000)));
-    $connectTimeoutMs = min(8000, $timeoutMs);
-    $attempts = strtoupper($method) === 'GET' ? ($timeoutSeconds > 15.0 ? 1 : 3) : 1;
+
+    $method = strtoupper($method);
+    $budget = max(0.15, min(180.0, $timeoutSeconds));
+    $deadline = microtime(true) + $budget;
+    // GET is read-only; PATCH here sets absolute values and is idempotent.
+    // Never blindly retry POST or conditional PUT writes.
+    $retrySafe = in_array($method, ['GET', 'PATCH'], true);
+    $maxAttempts = $retrySafe ? 4 : 1;
     $lastError = '';
-    for ($attempt = 0; $attempt < $attempts; $attempt++) {
+    $lastCode = 0;
+    $retryHttpCodes = [408, 425, 429, 500, 502, 503, 504];
+
+    for ($attempt = 0; $attempt < $maxAttempts; $attempt++) {
+        $remaining = $deadline - microtime(true);
+        if ($remaining < 0.12) break;
+        $attemptsLeft = max(1, $maxAttempts - $attempt);
+        $attemptTimeoutMs = max(150, min(180000, (int)floor(($remaining / $attemptsLeft) * 1000)));
+        $connectTimeoutMs = max(100, min(5000, $attemptTimeoutMs));
         $responseHeaders = [];
         $ch = curl_init($url);
         curl_setopt_array($ch, [
-            CURLOPT_CUSTOMREQUEST => $method, CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CONNECTTIMEOUT_MS => $connectTimeoutMs, CURLOPT_TIMEOUT_MS => $timeoutMs, CURLOPT_NOSIGNAL => true,
-            CURLOPT_HTTPHEADER => $headers, CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_CUSTOMREQUEST => $method,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT_MS => $connectTimeoutMs,
+            CURLOPT_TIMEOUT_MS => $attemptTimeoutMs,
+            CURLOPT_NOSIGNAL => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HEADERFUNCTION => function ($curl, $line) use (&$responseHeaders) {
-                $len = strlen($line); $parts = explode(':', $line, 2);
+                $len = strlen($line);
+                $parts = explode(':', $line, 2);
                 if (count($parts) === 2) $responseHeaders[strtolower(trim($parts[0]))] = trim($parts[1]);
                 return $len;
             }
         ]);
-        if ($payload !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION));
-        $body = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); $errno = (int)curl_errno($ch); $error = curl_error($ch); curl_close($ch);
-        if ($body !== false) return ['code' => $code, 'body' => (string)$body, 'json' => json_decode((string)$body, true), 'headers' => $responseHeaders];
-        $lastError = $error;
-        if ($attempt + 1 >= $attempts || !in_array($errno, [5, 6, 7, 28, 35], true)) break;
-        usleep((int)(150000 * ($attempt + 1)));
+        if ($payload !== null) {
+            $encoded = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+            if ($encoded === false) { curl_close($ch); throw new RuntimeException('Could not encode Firebase JSON payload.'); }
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $encoded);
+        }
+        $body = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $errno = (int)curl_errno($ch);
+        $error = curl_error($ch);
+        curl_close($ch);
+
+        if ($body !== false) {
+            $lastCode = $code;
+            if (!($retrySafe && in_array($code, $retryHttpCodes, true) && $attempt + 1 < $maxAttempts && microtime(true) < $deadline)) {
+                return ['code' => $code, 'body' => (string)$body, 'json' => json_decode((string)$body, true), 'headers' => $responseHeaders];
+            }
+            $lastError = 'Firebase HTTP ' . $code;
+        } else {
+            $lastError = $error !== '' ? $error : ('cURL error ' . $errno);
+            $retryableCurl = in_array($errno, [5, 6, 7, 18, 28, 35, 52, 55, 56], true);
+            if (!$retrySafe || !$retryableCurl || $attempt + 1 >= $maxAttempts || microtime(true) >= $deadline) break;
+        }
+
+        $remaining = $deadline - microtime(true);
+        if ($remaining <= 0.03) break;
+        $backoffUs = min((int)(50000 * ($attempt + 1)), (int)floor($remaining * 1000000));
+        if ($backoffUs > 0) usleep($backoffUs);
     }
-    throw new RuntimeException('Firebase network error after retry: ' . $lastError);
+    throw new RuntimeException('Firebase request failed within ' . number_format($budget, 2) . 's (HTTP ' . $lastCode . '): ' . $lastError);
 }
 function fb_request(string $method, string $path, $payload = null, array $extraHeaders = [], array $query = [], float $timeoutSeconds = 12.0): array {
     return fb_request_target(1, $method, $path, $payload, $extraHeaders, $query, $timeoutSeconds);
@@ -157,14 +212,25 @@ function fb_delete(string $path): void {
     if ($r['code'] < 200 || $r['code'] >= 300) throw new RuntimeException('Firebase delete failed at ' . $path . ' (HTTP ' . $r['code'] . ').');
 }
 function fb_create_only_target(int $slot, string $path, array $data): bool {
-    $read = fb_request_target($slot, 'GET', $path, null, ['X-Firebase-ETag: true']);
+    // Firebase defines the literal null_etag precondition for creating only when
+    // the target is empty. A 412 means another request already created the node.
+    // print=silent cuts response bandwidth; it does not weaken the atomic condition.
+    $write = fb_request_target($slot, 'PUT', $path, $data, ['If-Match: null_etag'], ['print' => 'silent'], 8.0);
+    if ($write['code'] === 412) return false;
+    if ($write['code'] >= 200 && $write['code'] < 300) return true;
+    // Compatibility fallback only for a server/proxy rejecting this conditional
+    // request syntax. The fallback retains the original ETag compare-and-swap.
+    if ($write['code'] !== 400 && $write['code'] !== 405) {
+        throw new RuntimeException('Firebase atomic create failed (HTTP ' . $write['code'] . ').');
+    }
+    $read = fb_request_target($slot, 'GET', $path, null, ['X-Firebase-ETag: true'], [], 5.0);
     if ($read['code'] < 200 || $read['code'] >= 300) throw new RuntimeException('Firebase duplicate lookup failed (HTTP ' . $read['code'] . ').');
     if (trim($read['body']) !== '' && trim($read['body']) !== 'null') return false;
     $etag = (string)($read['headers']['etag'] ?? '');
     if ($etag === '') throw new RuntimeException('Firebase did not provide an ETag.');
-    $write = fb_request_target($slot, 'PUT', $path, $data, ['If-Match: ' . $etag]);
-    if ($write['code'] === 412) return false;
-    if ($write['code'] < 200 || $write['code'] >= 300) throw new RuntimeException('Firebase atomic create failed (HTTP ' . $write['code'] . ').');
+    $fallbackWrite = fb_request_target($slot, 'PUT', $path, $data, ['If-Match: ' . $etag], [], 5.0);
+    if ($fallbackWrite['code'] === 412) return false;
+    if ($fallbackWrite['code'] < 200 || $fallbackWrite['code'] >= 300) throw new RuntimeException('Firebase conditional create failed (HTTP ' . $fallbackWrite['code'] . ').');
     return true;
 }
 function fb_create_only(string $path, array $data): bool {
@@ -191,6 +257,80 @@ function fb_atomic_add(string $path, array $delta, int $retries = 8, float $time
 function add_sharded_totals(string $root, array $delta, float $timeoutSeconds = 12.0): void {
     $shard = sprintf('%02d', random_int(0, 31));
     fb_atomic_add($root . '/shards/' . $shard, $delta, 2, $timeoutSeconds);
+}
+function add_sharded_totals_single(string $root, array $delta, float $timeoutSeconds = 0.8): void {
+    // Best-effort metrics use one atomic server-side increment PATCH instead of
+    // a slower GET/ETag/PUT pair. The write is never replayed after ambiguity.
+    $base = rtrim(envv('PB_FIREBASE_DATABASE_URL'), '/');
+    if ($base === '') throw new RuntimeException('Primary Firebase database URL is not configured.');
+    $shard = sprintf('%02d', random_int(0, 31));
+    $updates = [];
+    foreach ($delta as $field => $value) {
+        $field = (string)$field;
+        if (!preg_match('/^[A-Za-z0-9_-]{1,100}$/', $field) || !is_numeric($value) || !is_finite((float)$value)) {
+            throw new RuntimeException('Invalid aggregate increment field.');
+        }
+        $updates[trim($root, '/') . '/shards/' . $shard . '/' . $field] = ['.sv' => ['increment' => (float)$value]];
+    }
+    if (!$updates) return;
+    $encoded = json_encode($updates, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+    if ($encoded === false) throw new RuntimeException('Could not encode metric increment patch.');
+    $token = firebase_token(1);
+    $url = $base . '.json?print=silent';
+    $timeoutMs = max(200, min(2000, (int)ceil(max(0.2, $timeoutSeconds) * 1000)));
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => 'PATCH', CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => min(1000, $timeoutMs), CURLOPT_TIMEOUT_MS => $timeoutMs,
+        CURLOPT_NOSIGNAL => true, CURLOPT_POSTFIELDS => $encoded,
+        CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $token, 'Accept: application/json', 'Content-Type: application/json', 'Connection: keep-alive'],
+        CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2
+    ]);
+    $body = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $errno = (int)curl_errno($ch); $error = curl_error($ch); curl_close($ch);
+    if ($body === false || $code < 200 || $code >= 300) {
+        throw new RuntimeException('Atomic metric increment failed (HTTP ' . $code . ', cURL ' . $errno . '): ' . $error);
+    }
+}
+function add_sharded_totals_pair(string $firstRoot, string $secondRoot, array $delta, float $timeoutSeconds = 1.5): void {
+    // One atomic Firebase multi-location PATCH updates both report periods. Each
+    // field uses the server-side increment transform, so concurrent devices do
+    // not overwrite one another. This non-idempotent PATCH is sent exactly once.
+    $base = rtrim(envv('PB_FIREBASE_DATABASE_URL'), '/');
+    if ($base === '') throw new RuntimeException('Primary Firebase database URL is not configured.');
+    $updates = [];
+    foreach ([$firstRoot, $secondRoot] as $root) {
+        $shard = sprintf('%02d', random_int(0, 31));
+        foreach ($delta as $field => $value) {
+            $field = (string)$field;
+            if (!preg_match('/^[A-Za-z0-9_-]{1,100}$/', $field) || !is_numeric($value) || !is_finite((float)$value)) {
+                throw new RuntimeException('Invalid aggregate increment field.');
+            }
+            $path = trim($root, '/') . '/shards/' . $shard . '/' . $field;
+            $updates[$path] = ['.sv' => ['increment' => (float)$value]];
+        }
+    }
+    if (!$updates) return;
+    $encoded = json_encode($updates, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PRESERVE_ZERO_FRACTION);
+    if ($encoded === false) throw new RuntimeException('Could not encode report increment patch.');
+    $token = firebase_token(1);
+    $url = $base . '.json?print=silent';
+    $timeoutMs = max(250, min(5000, (int)ceil(max(0.25, $timeoutSeconds) * 1000)));
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => 'PATCH', CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CONNECTTIMEOUT_MS => min(2000, $timeoutMs), CURLOPT_TIMEOUT_MS => $timeoutMs,
+        CURLOPT_NOSIGNAL => true, CURLOPT_POSTFIELDS => $encoded,
+        CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $token, 'Accept: application/json', 'Content-Type: application/json', 'Connection: keep-alive'],
+        CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2
+    ]);
+    $body = curl_exec($ch); $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $errno = (int)curl_errno($ch); $error = curl_error($ch); curl_close($ch);
+    if ($body === false || $code < 200 || $code >= 300) {
+        // Do not retry a server-side increment after an ambiguous transport error;
+        // retrying could count the same already-committed event twice.
+        throw new RuntimeException('Atomic report increment failed (HTTP ' . $code . ', cURL ' . $errno . '): ' . $error);
+    }
 }
 function key_hash(string $key): string { return hash_hmac('sha256', strtoupper(trim($key)), secret_pepper()); }
 function encrypt_admin_key(string $plain): array {
@@ -265,9 +405,9 @@ function authenticate_app(array $body): array {
     if (!empty($device['blocked'])) json_out(403, ['ok' => false, 'message' => 'This installation is disabled by administrator.']);
     return ['key' => $app, 'device_id' => $deviceId, 'device' => $device];
 }
-function update_device_seen(string $deviceId, array $body, string $keyHash, string $state = 'active'): void {
+function update_device_seen(string $deviceId, array $body, string $keyHash, string $state = 'active', ?array $oldRecord = null): void {
     $path = 'devices/' . $deviceId;
-    $old = fb_get($path);
+    $old = is_array($oldRecord) ? $oldRecord : fb_get($path);
     $now = time();
     $record = [
         'device_id' => $deviceId,
@@ -363,7 +503,11 @@ function api_ingest(array $body): void {
     $simIdentity = $simNumber !== '' ? 'number:' . $simNumber : ('device:' . $deviceId . '|slot:' . $simSlot . '|carrier:' . u_lower($simCarrier));
     $simKey = hash('sha256', $simIdentity);
     if ($simLabel === '') $simLabel = $simCarrier !== '' ? $simCarrier . ' · ' . ($simSlot === 'unknown' ? 'SIM' : 'SIM ' . $simSlot) : ($simSlot === 'unknown' ? 'SIM unknown' : 'SIM ' . $simSlot);
-    $lookupAttempts = $txnId !== '' ? fb_get(lookup_attempt_path($txnId)) : [];
+    $lookupAttempts = [];
+    if ($txnId !== '') {
+        try { $lookupAttempts = fb_get(lookup_attempt_path($txnId)); }
+        catch (Throwable $lookupCounterError) { error_log('[PB_INGEST] verification attempt metadata read skipped: ' . get_class($lookupCounterError)); }
+    }
     $priorVerifyAttempts = (int)($lookupAttempts['attempt_count'] ?? 0);
     $record = [
         'amount' => $amount,
@@ -402,11 +546,9 @@ function api_ingest(array $body): void {
         'device_id' => $auth['device_id']
     ];
     $smsSaved = fb_create_only('sms_messages/' . $smsKey, $record);
-    if ($smsSaved) {
-        try { add_sharded_totals('reports/monthly/' . $month, ['sms_count' => 1], 1.0); } catch (Throwable $ignored) {}
-        try { add_sharded_totals('reports/daily/' . $day, ['sms_count' => 1], 1.0); } catch (Throwable $ignored) {}
-    }
     $txnSaved = false; $txnDuplicate = false; $txnKey = '';
+    $duplicateEventSaved = false;
+    $reportTotals = [];
     if ($txnId !== '' && $amount > 0) {
         $txnKey = hash('sha256', $method . '|' . $txnId);
         $record['sms_id'] = $smsKey;
@@ -425,10 +567,7 @@ function api_ingest(array $body): void {
                     'created_at' => $createdAt, 'stored_at' => $storedAt
                 ];
                 try {
-                    if (fb_create_only('duplicate_events/' . $duplicateEventKey, $duplicateEvent)) {
-                        add_sharded_totals('reports/monthly/' . $month, ['duplicate_txn_count' => 1]);
-                        add_sharded_totals('reports/daily/' . $day, ['duplicate_txn_count' => 1]);
-                    }
+                    if (fb_create_only('duplicate_events/' . $duplicateEventKey, $duplicateEvent)) $duplicateEventSaved = true;
                 } catch (Throwable $ignored) {}
             }
         }
@@ -444,8 +583,7 @@ function api_ingest(array $body): void {
                 $totals['outgoing_count'] = 1; $totals['outgoing_amount'] = $amount;
                 $totals[$simPrefix . 'outgoing_count'] = 1; $totals[$simPrefix . 'outgoing_amount'] = $amount;
             }
-            try { add_sharded_totals('reports/monthly/' . $month, $totals); } catch (Throwable $ignored) {}
-            try { add_sharded_totals('reports/daily/' . $day, $totals); } catch (Throwable $ignored) {}
+            $reportTotals = $totals;
             try {
                 fb_create_only('reports/sim_registry/' . $simKey, [
                     'sim_key' => $simKey, 'label' => $simLabel, 'number' => $simNumber,
@@ -453,12 +591,24 @@ function api_ingest(array $body): void {
                     'created_at' => $storedAt
                 ]);
             } catch (Throwable $ignored) {}
+        } else {
+            $reportTotals = [];
         }
-        $txnLookupHash = hash('sha256', $txnId);
-        try { fb_write('PATCH', 'payment_txn_index/' . $txnLookupHash, [$method => $txnKey]); } catch (Throwable $ignored) {}
-        try { fb_write('PATCH', 'payment_txn_lookup/' . $txnLookupHash, [$method => $txnKey]); } catch (Throwable $ignored) {}
     }
-    update_device_seen($deviceId, $body, $auth['key']['hash'], 'active');
+    // SMS counts include provider messages with missing transaction IDs/amounts too.
+    if ($smsSaved) $reportTotals['sms_count'] = 1;
+    if ($duplicateEventSaved) $reportTotals['duplicate_txn_count'] = 1;
+    if ($reportTotals) {
+        try { add_sharded_totals_pair('reports/monthly/' . $month, 'reports/daily/' . $day, $reportTotals, 1.5); }
+        catch (Throwable $reportError) { error_log('[PB_INGEST] aggregate update skipped: ' . get_class($reportError)); }
+    }
+    // Reuse the authenticated device snapshot and avoid a write on every SMS.
+    // Heartbeat metadata is refreshed at most once per minute by ingest traffic.
+    $lastDeviceSeen = (int)($auth['device']['last_seen'] ?? 0);
+    if ($storedAt - $lastDeviceSeen >= 60) {
+        try { update_device_seen($deviceId, $body, $auth['key']['hash'], 'active', $auth['device']); }
+        catch (Throwable $deviceUpdateError) { error_log('[PB_INGEST] device heartbeat metadata update skipped: ' . get_class($deviceUpdateError)); }
+    }
     json_out(200, ['ok' => true, 'sms_saved' => $smsSaved, 'transaction_saved' => $txnSaved, 'duplicate_transaction' => $txnDuplicate, 'transaction_key' => $txnKey, 'message' => $txnDuplicate ? 'SMS stored; transaction already exists.' : 'Payment SMS accepted.']);
 }
 function normalize_number(string $value): string {
@@ -502,7 +652,7 @@ function add_api_metric(string $result, string $keyHash = ''): void {
     }
     // A single daily aggregate write pair per request keeps Firebase traffic lower.
     // Admin period reports fold the selected day keys into one read.
-    try { add_sharded_totals('metrics/api_daily/' . $day, $delta, 1.0); } catch (Throwable $ignored) {}
+    try { add_sharded_totals_single('metrics/api_daily/' . $day, $delta, 0.8); } catch (Throwable $ignored) {}
 }
 function purge_api_key_metrics(string $keyHash): void {
     if (!preg_match('/^[a-f0-9]{64}$/i', $keyHash)) throw new RuntimeException('Invalid API key hash for metric cleanup.');
@@ -545,8 +695,13 @@ function period_api_metrics(int $start, int $end): array {
 }
 function verify_response(bool $ok, string $result, string $message, ?array $record = null, array $extra = []): void {
     $inflightToken = (string)($GLOBALS['PB_VERIFY_INFLIGHT_TOKEN'] ?? '');
-    if ($inflightToken !== '') { update_verify_inflight('remove', $inflightToken); unset($GLOBALS['PB_VERIFY_INFLIGHT_TOKEN']); }
-    add_api_metric($result, (string)($GLOBALS['PB_CURRENT_VERIFY_KEY_HASH'] ?? ''));
+    if ($inflightToken !== '') {
+        try { update_verify_inflight('remove', $inflightToken); }
+        catch (Throwable $cleanupError) { error_log('[PB_VERIFY_CLEANUP] ' . get_class($cleanupError)); }
+        unset($GLOBALS['PB_VERIFY_INFLIGHT_TOKEN']);
+    }
+    try { add_api_metric($result, (string)($GLOBALS['PB_CURRENT_VERIFY_KEY_HASH'] ?? '')); }
+    catch (Throwable $metricError) { error_log('[PB_VERIFY_METRIC] ' . get_class($metricError)); }
     $out = ['status' => $ok, 'result' => $result, 'message' => $message];
     if ($record !== null) {
         $out = array_merge($out, [
@@ -601,73 +756,118 @@ function query_candidate(string $method, string $txnId, float $timeoutSeconds = 
     if (!is_array($r['json'])) return null;
     return ['path' => $path, 'key' => $key, 'record' => $r['json'], 'etag' => (string)($r['headers']['etag'] ?? '')];
 }
-function query_candidates_for_txn(string $txnId, float $timeoutSeconds, bool $allowLegacyFallback = true, string $preferredMethod = ''): array {
-    $endAt = microtime(true) + max(0.2, $timeoutSeconds);
-    $lookupPath = 'payment_txn_lookup/' . hash('sha256', $txnId);
-    $remaining = max(0.2, $endAt - microtime(true));
-    try {
-        $lookup = fb_request('GET', $lookupPath, null, [], [], min(0.8, $remaining));
-        if ($lookup['code'] < 200 || $lookup['code'] >= 300) throw new RuntimeException('Fast transaction index lookup failed (HTTP ' . $lookup['code'] . ').');
-    } catch (Throwable $lookupError) {
-        // The fast index is an optimization, not the source of truth. If it is
-        // temporarily unavailable, try the deterministic transaction record key.
-        // Only report an empty lookup when every attempted direct read succeeded.
-        $methods = in_array(strtolower($preferredMethod), ['bkash', 'nagad', 'rocket'], true)
-            ? [strtolower($preferredMethod)] : ['bkash', 'nagad', 'rocket'];
-        $directCandidates = [];
-        $directSuccesses = 0;
-        $directErrors = [];
-        foreach ($methods as $directMethod) {
-            $remaining = $endAt - microtime(true);
-            if ($remaining <= 0.15) break;
-            try {
-                $direct = query_candidate($directMethod, $txnId, min(1.0, max(0.2, $remaining)));
-                $directSuccesses++;
-                if ($direct !== null) $directCandidates[] = $direct;
-            } catch (Throwable $directError) {
-                $directErrors[] = $directError->getMessage();
+function firebase_transaction_read_wave(string $base, string $token, string $txnId, array $methods, float $timeoutSeconds): array {
+    if (!function_exists('curl_multi_init') || !function_exists('curl_multi_exec')) {
+        throw new RuntimeException('PHP cURL multi support is required for parallel Firebase transaction lookup.');
+    }
+    $mh = curl_multi_init();
+    if ($mh === false) throw new RuntimeException('Could not initialize parallel Firebase lookup.');
+    $handles = []; $headersByMethod = [];
+    $timeoutMs = max(250, min(10000, (int)floor(max(0.25, $timeoutSeconds) * 1000)));
+    foreach ($methods as $method) {
+        $method = strtolower((string)$method);
+        if (!in_array($method, ['bkash', 'nagad', 'rocket'], true)) continue;
+        $key = hash('sha256', $method . '|' . $txnId);
+        $path = 'payment_transactions/' . $key;
+        $segments = array_map('rawurlencode', array_filter(explode('/', trim($path, '/')), 'strlen'));
+        $url = $base . '/' . implode('/', $segments) . '.json';
+        $headersByMethod[$method] = [];
+        $ch = curl_init($url);
+        if ($ch === false) { curl_multi_close($mh); throw new RuntimeException('Could not initialize Firebase lookup request.'); }
+        curl_setopt_array($ch, [
+            CURLOPT_CUSTOMREQUEST => 'GET', CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT_MS => min(4000, $timeoutMs), CURLOPT_TIMEOUT_MS => $timeoutMs,
+            CURLOPT_NOSIGNAL => true,
+            CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $token, 'Accept: application/json', 'X-Firebase-ETag: true', 'Connection: keep-alive'],
+            CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_HEADERFUNCTION => function ($curl, $line) use (&$headersByMethod, $method) {
+                $len = strlen($line); $parts = explode(':', $line, 2);
+                if (count($parts) === 2) $headersByMethod[$method][strtolower(trim($parts[0]))] = trim($parts[1]);
+                return $len;
+            }
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[$method] = ['handle'=>$ch, 'path'=>$path, 'key'=>$key];
+    }
+    $running = null; $done = [];
+    do {
+        $multiCode = curl_multi_exec($mh, $running);
+        while (($info = curl_multi_info_read($mh)) !== false) {
+            if (($info['msg'] ?? 0) === CURLMSG_DONE && isset($info['handle'])) $done[] = $info['handle'];
+        }
+        if ($multiCode !== CURLM_OK) break;
+        if ($running > 0) {
+            $selected = curl_multi_select($mh, 0.05);
+            if ($selected === -1) usleep(10000);
+        }
+    } while ($running > 0);
+    while (($info = curl_multi_info_read($mh)) !== false) {
+        if (($info['msg'] ?? 0) === CURLMSG_DONE && isset($info['handle'])) $done[] = $info['handle'];
+    }
+    $results = []; $errors = []; $retry = [];
+    foreach ($handles as $method => $info) {
+        $ch = $info['handle']; $body = curl_multi_getcontent($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE); $errno = (int)curl_errno($ch); $error = curl_error($ch);
+        $completed = in_array($ch, $done, true);
+        $retryable = in_array($code, [408,425,429,500,502,503,504], true) || in_array($errno, [5,6,7,18,28,35,52,55,56], true) || !$completed;
+        if ($body === false || $errno !== 0 || !$completed || $code < 200 || $code >= 300) {
+            $errors[$method] = $method . ': ' . (!$completed ? 'lookup timeout' : ($error !== '' ? $error : ('HTTP ' . $code . ' / cURL ' . $errno)));
+            if ($retryable) $retry[] = $method;
+        } else {
+            $decoded = json_decode((string)$body, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                $errors[$method] = $method . ': invalid Firebase JSON'; $retry[] = $method;
+            } elseif ($decoded === null) {
+                $results[$method] = null;
+            } elseif (!is_array($decoded)) {
+                $errors[$method] = $method . ': unexpected transaction record type';
+            } else {
+                $recordTxn = strtoupper(trim((string)($decoded['txn_id'] ?? '')));
+                $recordMethod = strtolower(trim((string)($decoded['method'] ?? '')));
+                $etag = (string)($headersByMethod[$method]['etag'] ?? '');
+                if ($recordTxn !== $txnId || $recordMethod !== $method) $errors[$method] = $method . ': transaction record identity mismatch';
+                elseif ($etag === '') { $errors[$method] = $method . ': Firebase ETag missing'; $retry[] = $method; }
+                else $results[$method] = ['path'=>$info['path'], 'key'=>$info['key'], 'record'=>$decoded, 'etag'=>$etag];
             }
         }
-        if ($directCandidates) return $directCandidates;
-        if ($directSuccesses === count($methods)) return [];
-        throw new RuntimeException('Fast index and direct transaction lookup failed.');
+        curl_multi_remove_handle($mh, $ch); curl_close($ch);
     }
-    $lookupMap = is_array($lookup['json']) ? $lookup['json'] : [];
-    $fastCandidates = [];
-    foreach ($lookupMap as $method => $key) {
-        $cleanMethod = strtolower((string)$method);
-        $cleanKey = strtolower(preg_replace('/[^a-f0-9]/', '', (string)$key));
-        if (in_array($cleanMethod, ['bkash','nagad','rocket'], true) && strlen($cleanKey) === 64) {
-            $fastCandidates[] = ['path'=>'payment_transactions/' . $cleanKey, 'key'=>$cleanKey,
-                'record'=>['method'=>$cleanMethod,'txn_id'=>$txnId], 'etag'=>''];
+    curl_multi_close($mh);
+    return [$results, $errors, array_values(array_unique($retry))];
+}
+function query_candidates_direct(string $txnId, float $timeoutSeconds = 2.5): array {
+    $base = rtrim(envv('PB_FIREBASE_DATABASE_URL'), '/');
+    if ($base === '') throw new RuntimeException('Primary Firebase database URL is not configured.');
+    $token = firebase_token(1);
+    $methods = ['bkash', 'nagad', 'rocket'];
+    $budget = max(0.25, min(8.0, $timeoutSeconds));
+    $deadline = microtime(true) + $budget;
+    $firstBudget = max(0.25, $budget * 0.62);
+    [$results, $errors, $retryMethods] = firebase_transaction_read_wave($base, $token, $txnId, $methods, $firstBudget);
+    if ($errors && $retryMethods) {
+        $remaining = $deadline - microtime(true);
+        if ($remaining >= 0.25) {
+            // Retry transient/timeout paths together, not sequentially, within the
+            // same overall deadline. Permanent identity errors are not retried.
+            [$retryResults, $retryErrors] = firebase_transaction_read_wave($base, $token, $txnId, $retryMethods, $remaining);
+            foreach ($retryResults as $method => $result) { $results[$method] = $result; unset($errors[$method]); }
+            foreach ($retryErrors as $method => $error) $errors[$method] = $error;
         }
     }
-    if ($fastCandidates) return $fastCandidates;
-    // Backward-compatible index fallback is run only once per API request.
-    // New SMS uploads write the fast lookup node, so later polls are a single indexed read.
-    if (!$allowLegacyFallback) return [];
-    $indexPath = 'payment_txn_index/' . hash('sha256', $txnId);
-    $remaining = max(0.2, $endAt - microtime(true));
-    $index = fb_request('GET', $indexPath, null, [], [], min(0.8, $remaining));
-    if ($index['code'] < 200 || $index['code'] >= 300) throw new RuntimeException('Transaction index lookup failed (HTTP ' . $index['code'] . ').');
-    $indexMap = is_array($index['json']) ? $index['json'] : [];
-    $candidateKeys = [];
-    foreach ($indexMap as $method => $key) {
-        $cleanMethod = strtolower((string)$method);
-        $cleanKey = strtolower(preg_replace('/[^a-f0-9]/', '', (string)$key));
-        if (in_array($cleanMethod, ['bkash','nagad','rocket'], true) && strlen($cleanKey) === 64) $candidateKeys[$cleanMethod] = $cleanKey;
+    // A negative result is valid only after all three deterministic method reads
+    // completed successfully. Partial Firebase errors must never become not_found.
+    if ($errors || count($results) !== 3) {
+        throw new RuntimeException('Authoritative transaction lookup incomplete: ' . implode('; ', $errors));
     }
     $candidates = [];
-    foreach ($candidateKeys as $method => $key) {
-        $remaining = $endAt - microtime(true);
-        if ($remaining <= 0.15) break;
-        $path = 'payment_transactions/' . $key;
-        $r = fb_request('GET', $path, null, ['X-Firebase-ETag: true'], [], min(1.0, max(0.2, $remaining)));
-        if ($r['code'] >= 200 && $r['code'] < 300 && is_array($r['json'])) {
-            $candidates[] = ['path'=>$path, 'key'=>$key, 'record'=>$r['json'], 'etag'=>(string)($r['headers']['etag'] ?? '')];
-        }
-    }
+    foreach ($results as $candidate) if (is_array($candidate)) $candidates[] = $candidate;
     return $candidates;
+}
+function query_candidates_for_txn(string $txnId, float $timeoutSeconds, bool $allowLegacyFallback = true): array {
+    // The deterministic payment_transactions keys are the source of truth.
+    // Index nodes are only accelerators and may be absent if an earlier index
+    // PATCH was interrupted after the transaction itself had been stored.
+    return query_candidates_direct($txnId, $timeoutSeconds);
 }
 function api_verify(array $input): void {
     $apiKey = trim(header_value('X-API-Key'));
@@ -724,49 +924,49 @@ function api_verify(array $input): void {
     $GLOBALS['PB_VERIFY_INFLIGHT_TOKEN'] = $inflightToken;
     update_verify_inflight('add', $inflightToken, (string)$key['hash']);
     $wait = max(0, min(60, (int)$settings['wait_seconds']));
-    $poll = max(150, min(3000, (int)$settings['poll_interval_ms']));
+    $poll = max(500, min(3000, (int)$settings['poll_interval_ms']));
     $startedAt = microtime(true);
     $deadline = $startedAt + $wait;
     $lookupFailures = 0;
     $successfulLookups = 0;
     $lastLookupSucceeded = false;
     $legacyFallbackAvailable = true;
+    $lastLookupError = '';
     do {
         $remaining = $deadline - microtime(true);
-        $lookupBudget = $wait === 0 ? 1.25 : max(0.15, min(1.25, $remaining));
+        $lookupBudget = $wait === 0 ? 1.25 : max(0.25, min(2.5, $remaining));
         try {
             $allowLegacyFallback = $legacyFallbackAvailable;
             $legacyFallbackAvailable = false;
-            $candidates = query_candidates_for_txn($txnId, $lookupBudget, $allowLegacyFallback, $method);
+            $candidates = query_candidates_for_txn($txnId, $lookupBudget, $allowLegacyFallback);
             $successfulLookups++;
             $lastLookupSucceeded = true;
         } catch (Throwable $lookupError) {
             $lookupFailures++;
             $lastLookupSucceeded = false;
+            $lastLookupError = get_class($lookupError) . ': ' . substr($lookupError->getMessage(), 0, 240);
+            error_log('[PB_VERIFY_LOOKUP] transaction lookup failed: ' . $lastLookupError);
             $candidates = [];
         }
-        if ($checks['method'] && count($candidates) > 1) {
-            $candidates = array_values(array_filter($candidates, function ($candidate) use ($method) {
-                return strtolower((string)($candidate['record']['method'] ?? '')) === $method;
-            }));
-        }
         if (count($candidates) === 1 && empty($candidates[0]['etag'])) {
-            $fastMethod = strtolower((string)($candidates[0]['record']['method'] ?? ''));
-            try {
-                $liveCandidate = query_candidate($fastMethod, $txnId, max(0.25, min(1.0, $lookupBudget)));
-                $candidates = $liveCandidate === null ? [] : [$liveCandidate];
-                $lastLookupSucceeded = true;
-            } catch (Throwable $recordLookupError) {
-                // A fast index hit is not enough: the transaction record must be
-                // read with its ETag before verification. Retry transient record
-                // lookup failures inside the configured wait window instead of
-                // aborting the request on the first Firebase timeout.
-                $lookupFailures++;
-                $lastLookupSucceeded = false;
-                $candidates = [];
+            $lookupFailures++;
+            $lastLookupSucceeded = false;
+            $lastLookupError = 'Firebase ETag missing on authoritative candidate.';
+            error_log('[PB_VERIFY_LOOKUP] ' . $lastLookupError);
+            $candidates = [];
+        }
+        if (count($candidates) > 1) {
+            if ($checks['method']) {
+                $methodCandidates = array_values(array_filter($candidates, function ($candidate) use ($method) {
+                    return strtolower((string)($candidate['record']['method'] ?? '')) === $method;
+                }));
+                if (count($methodCandidates) === 1) $candidates = $methodCandidates;
+                elseif (count($methodCandidates) === 0) verify_response(false, 'mismatch', 'Transaction ID exists, but the payment method does not match.', null, ['checks'=>['method'=>false]]);
+                else verify_response(false, 'ambiguous', 'More than one transaction matches this Txn ID and payment method.');
+            } else {
+                verify_response(false, 'ambiguous', 'More than one transaction uses this Txn ID across payment methods. Supply the method or enable Payment method comparison.');
             }
         }
-        if (count($candidates) > 1) verify_response(false, 'ambiguous', 'More than one transaction uses this Txn ID across payment methods. Supply the method or enable Payment method comparison.');
         if (count($candidates) === 1) {
             $candidate = $candidates[0]; $record = $candidate['record'];
             if (strtoupper((string)($record['txn_id'] ?? '')) !== $txnId) {
@@ -807,9 +1007,9 @@ function api_verify(array $input): void {
                 verify_response(false, 'conflict', 'Transaction changed during verification. Retry once.');
             }
             if ($write['code'] < 200 || $write['code'] >= 300) verify_response(false, 'service_unavailable', 'Payment matched but could not be reserved. Retry the request.');
-            try { add_sharded_totals('reports/monthly/' . (string)($record['month'] ?? date('Y-m')), ['used_count' => 1], 1.0); } catch (Throwable $ignored) {}
             if (!empty($record['day'])) {
-                try { add_sharded_totals('reports/daily/' . (string)$record['day'], ['used_count' => 1], 1.0); } catch (Throwable $ignored) {}
+                try { add_sharded_totals_pair('reports/monthly/' . (string)($record['month'] ?? date('Y-m')), 'reports/daily/' . (string)$record['day'], ['used_count' => 1], 1.5); }
+                catch (Throwable $reportError) { error_log('[PB_VERIFY_METRIC] report increment skipped: ' . get_class($reportError)); }
             }
             verify_response(true, 'success', 'Payment verified. Only enabled verification rules for this API key were applied.', $record, ['checks' => $matches]);
         }
@@ -824,7 +1024,7 @@ function api_verify(array $input): void {
         $inflightToken = (string)($GLOBALS['PB_VERIFY_INFLIGHT_TOKEN'] ?? '');
         if ($inflightToken !== '') { update_verify_inflight('remove', $inflightToken); unset($GLOBALS['PB_VERIFY_INFLIGHT_TOKEN']); }
         try { add_api_metric('service_error', (string)($GLOBALS['PB_CURRENT_VERIFY_KEY_HASH'] ?? '')); } catch (Throwable $ignored) {}
-        json_out(503, ['status'=>false, 'result'=>'service_unavailable', 'message'=>'Transaction lookup service is temporarily busy. Please retry.', 'retry_after_seconds'=>2, 'waited_seconds'=>round($elapsed,2)]);
+        json_out(503, ['status'=>false, 'result'=>'service_unavailable', 'message'=>'Transaction lookup service is temporarily busy. Please retry.', 'retry_after_seconds'=>2, 'waited_seconds'=>round($elapsed,2), 'failure_stage'=>'firebase_transaction_lookup']);
     }
     try { add_lookup_attempt($txnId, 1, 0.15); } catch (Throwable $ignored) {}
     verify_response(false, 'not_found', 'Transaction ID not found within the configured wait period.', null, ['code'=>'TXNID_NOT_FOUND', 'retry_after_seconds'=>2, 'waited_seconds'=>round($elapsed,2)]);
@@ -1795,7 +1995,7 @@ function admin_page(): void {
       <section class="panel"><div class="panelhead"><h2>Uploaded App Versions</h2><span class="badge"><?=count($publishedReleases)?> versions</span></div><div class="tablewrap"><table><thead><tr><th>Version</th><th>Code</th><th>File Size</th><th>SHA-256</th><th>Published</th><th>Status</th><th>Action</th></tr></thead><tbody><?php if(!$publishedReleases):?><tr><td colspan="7" class="empty">No version archive yet. New verified uploads will appear here.</td></tr><?php else:foreach($publishedReleases as $code=>$release):if(!is_array($release))continue;?><tr><td><?=h((string)($release['version_name']??''))?></td><td><?=number_format((int)$code)?></td><td><?=number_format((int)($release['size_bytes']??0)/1048576,2)?> MB</td><td class="wrap-cell"><?=h(substr((string)($release['sha256']??''),0,20))?>…</td><td><?=!empty($release['published_at'])?h(date('d/m/Y H:i',(int)$release['published_at'])):'—'?></td><td><?=$badge(empty($release['enabled'])?'DELETED':((int)($publishedRelease['version_code']??0)===(int)$code?'LATEST':'ARCHIVED'),!empty($release['enabled'])&&(int)($publishedRelease['version_code']??0)===(int)$code)?></td><td><form method="post" onsubmit="return confirm('Permanently delete this APK file?')"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="delete_app_release"><input type="hidden" name="version_code" value="<?=h((string)$code)?>"><button class="danger small">Delete APK</button></form></td></tr><?php endforeach;endif;?></tbody></table></div><p class="sectionnote">Every valid com.payment.bridge APK is accepted and the most recently uploaded release becomes the current update target. Android itself only installs an in-place update when the APK Version Code is higher than the installed app and the signing certificate matches.</p></section>
       <script>(function(){var f=document.getElementById('appUpdateForm');if(!f)return;var chunkSize=0;function request(fields,blob,onProgress){return new Promise(function(resolve,reject){var data=new FormData();Object.keys(fields).forEach(function(k){data.append(k,fields[k]);});if(blob)data.append('chunk',blob,'apk-part.bin');var x=new XMLHttpRequest();x.open('POST',location.pathname+'?tab=updates',true);x.onload=function(){var obj=null;try{obj=JSON.parse(x.responseText||'{}');}catch(e){}if(x.status>=200&&x.status<300&&obj&&obj.ok)resolve(obj);else reject(new Error(obj&&obj.message?obj.message:'Server upload failed (HTTP '+x.status+').'));};x.onerror=function(){reject(new Error('Network/DNS error during this APK part.'));};if(onProgress)x.upload.onprogress=onProgress;x.send(data);});}async function retry(fields,blob,progress){var last;for(var n=0;n<3;n++){try{return await request(fields,blob,progress);}catch(e){last=e;if(n<2)await new Promise(function(r){setTimeout(r,500*(n+1));});}}throw last;}f.addEventListener('submit',async function(e){e.preventDefault();var file=f.querySelector('input[type=file]').files[0];var status=document.getElementById('apkUploadStatus');var wrap=document.getElementById('apkUploadProgress');var bar=document.getElementById('apkUploadBar');var button=f.querySelector('button[type=submit],button:not([type])');if(!file){status.textContent='Select an APK file first.';return;}if(file.size<1000||file.size>128*1024*1024){status.textContent='APK must be between 1 KB and 128 MB.';return;}var csrf=f.getAttribute('data-csrf')||'';wrap.style.display='block';bar.style.width='0%';if(button)button.disabled=true;try{status.textContent='Starting secure upload…';var begin=await retry({action:'begin_app_upload',csrf:csrf,file_size:String(file.size),file_name:file.name},null);var id=begin.upload_id;chunkSize=Number(begin.chunk_size)||0;if(chunkSize<32768||chunkSize>256*1024)throw new Error('Server returned an invalid APK chunk size. Reload the page and retry.');var total=Number(begin.chunk_count)||Math.ceil(file.size/chunkSize);if(total!==Math.ceil(file.size/chunkSize))throw new Error('APK chunk plan does not match file size.');status.textContent='Uploading APK in '+total+' small parts…';var sent=0;for(var i=0;i<total;i++){var from=i*chunkSize;var to=Math.min(file.size,from+chunkSize);var part=file.slice(from,to);var base={action:'upload_app_chunk',csrf:csrf,upload_id:id,chunk_no:String(i)};status.textContent='Uploading APK part '+(i+1)+' of '+total+'…';await retry(base,part,function(ev){if(ev.lengthComputable){var pct=Math.min(99,Math.round(((sent+ev.loaded)/file.size)*100));bar.style.width=pct+'%';status.textContent='Uploading APK: '+pct+'% ('+((sent+ev.loaded)/1048576).toFixed(2)+' / '+(file.size/1048576).toFixed(2)+' MB)';}});sent+=part.size;var pct=Math.min(99,Math.round(sent/file.size*100));bar.style.width=pct+'%';status.textContent='Uploaded '+(i+1)+' / '+total+' parts · '+(sent/1048576).toFixed(2)+' MB';}status.textContent='All parts uploaded. Reassembling APK and checking package name…';var finish=await retry({action:'finish_app_upload',csrf:csrf,upload_id:id,version_name:f.querySelector('[name=version_name]').value,min_supported_version:f.querySelector('[name=min_supported_version]').value,release_notes:f.querySelector('[name=release_notes]').value},null);bar.style.width='100%';status.textContent='Published successfully: '+finish.version_name+' · '+(finish.size_bytes/1048576).toFixed(2)+' MB. SHA-256 and package name verified.';setTimeout(function(){location.reload();},1200);}catch(err){status.textContent='Upload failed: '+(err&&err.message?err.message:'Unknown error');}finally{if(button)button.disabled=false;}});var submitBtn=f.querySelector('button[type=submit]');if(submitBtn)submitBtn.disabled=false;})();</script>
     <?php elseif ($tab === 'settings'): ?>
-      <div class="grid2"><section class="panel"><h2>Verification rules</h2><p>Enabled rules are ANDed together. Txn ID is used for indexed lookup even if its compare switch is turned off.</p><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="save_verification"><div class="checkgrid"><?php foreach(['verify_number'=>'Sender number','verify_amount'=>'Amount','verify_txn_id'=>'Transaction ID','verify_method'=>'Payment method'] as $field=>$label):?><div class="checkitem"><label><input type="checkbox" name="<?=$field?>" <?=!empty($verification[$field])?'checked':''?>><?=h($label)?></label></div><?php endforeach;?></div><label>Wait for SMS sync (seconds, 0–60)</label><input type="number" name="wait_seconds" min="0" max="60" value="<?=h((string)$verification['wait_seconds'])?>"><label>Firebase polling interval (ms, 150–3000)</label><input type="number" name="poll_interval_ms" min="150" max="3000" step="50" value="<?=h((string)$verification['poll_interval_ms'])?>"><label>Default API Requests / Minute (10–1200 · per-key value overrides this)</label><input type="number" name="default_rate_limit_per_min" min="10" max="1200" value="<?=h((string)($verification['default_rate_limit_per_min']??120))?>"><button style="margin-top:13px">Save verification settings</button></form></section><section class="panel"><h2>Automatic Data Cleanup</h2><p>Only old raw SMS messages and duplicate-event detail rows are eligible. Canonical payment_transactions, TxnID indexes, API keys and aggregates are never deleted.</p><?php $maintenanceSettings = []; try { $maintenanceSettings = fb_get('settings/maintenance'); } catch (Throwable $ignored) {} ?><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="run_cleanup"><label>Keep data for at least (days · minimum 90)</label><input type="number" min="90" max="3650" name="retention_days" value="<?=h((string)($maintenanceSettings['cleanup_retention_days']??365))?>"><div class="checkitem"><label><input type="checkbox" name="automatic_cleanup" <?=!array_key_exists('automatic_cleanup',$maintenanceSettings)||!empty($maintenanceSettings['automatic_cleanup'])?'checked':''?>>Enable daily automatic cleanup</label></div><button style="margin-top:10px">Save &amp; Run Cleanup</button></form></section><section class="panel"><h2>System information</h2><p>Database: One Firebase Realtime Database</p><p>Backend: Single PHP index.php</p><p>Timezone: Asia/Dhaka</p><p>Application upload keys: shared across multiple devices</p><p>Signer SHA-256: disabled</p><p>Request-by-request logs: disabled; only daily/monthly aggregate API counters are stored for reporting.</p><p>Verification API limit: admin-managed per-key rolling window, 10–1200 requests per minute; global default is also editable in Admin. API polling interval can be set to 150–3000 ms. Render Free worker/memory limits still cap concurrent long-wait API requests.</p><p>Payment records are kept by unique Method + Txn ID. A successful API verification permanently sets verification_consumed; later requests stay DUPLICATE even if an Admin status field is accidentally edited.</p></section></div>
+      <div class="grid2"><section class="panel"><h2>Verification rules</h2><p>Enabled rules are ANDed together. Txn ID always locates the canonical transaction record, even if its comparison switch is turned off.</p><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="save_verification"><div class="checkgrid"><?php foreach(['verify_number'=>'Sender number','verify_amount'=>'Amount','verify_txn_id'=>'Transaction ID','verify_method'=>'Payment method'] as $field=>$label):?><div class="checkitem"><label><input type="checkbox" name="<?=$field?>" <?=!empty($verification[$field])?'checked':''?>><?=h($label)?></label></div><?php endforeach;?></div><label>Wait for SMS sync (seconds, 0–60)</label><input type="number" name="wait_seconds" min="0" max="60" value="<?=h((string)$verification['wait_seconds'])?>"><label>Firebase polling interval (ms, 150–3000)</label><input type="number" name="poll_interval_ms" min="150" max="3000" step="50" value="<?=h((string)$verification['poll_interval_ms'])?>"><label>Default API Requests / Minute (10–1200 · per-key value overrides this)</label><input type="number" name="default_rate_limit_per_min" min="10" max="1200" value="<?=h((string)($verification['default_rate_limit_per_min']??120))?>"><button style="margin-top:13px">Save verification settings</button></form></section><section class="panel"><h2>Automatic Data Cleanup</h2><p>Only old raw SMS messages and duplicate-event detail rows are eligible. Canonical payment_transactions, TxnID indexes, API keys and aggregates are never deleted.</p><?php $maintenanceSettings = []; try { $maintenanceSettings = fb_get('settings/maintenance'); } catch (Throwable $ignored) {} ?><form method="post"><input type="hidden" name="csrf" value="<?=h($csrf)?>"><input type="hidden" name="action" value="run_cleanup"><label>Keep data for at least (days · minimum 90)</label><input type="number" min="90" max="3650" name="retention_days" value="<?=h((string)($maintenanceSettings['cleanup_retention_days']??365))?>"><div class="checkitem"><label><input type="checkbox" name="automatic_cleanup" <?=!array_key_exists('automatic_cleanup',$maintenanceSettings)||!empty($maintenanceSettings['automatic_cleanup'])?'checked':''?>>Enable daily automatic cleanup</label></div><button style="margin-top:10px">Save &amp; Run Cleanup</button></form></section><section class="panel"><h2>System information</h2><p>Database: One Firebase Realtime Database</p><p>Backend: Single PHP index.php</p><p>Timezone: Asia/Dhaka</p><p>Application upload keys: shared across multiple devices</p><p>Signer SHA-256: disabled</p><p>Request-by-request logs: disabled; only daily/monthly aggregate API counters are stored for reporting.</p><p>Verification API limit: admin-managed per-key rolling window, 10–1200 requests per minute; global default is also editable in Admin. API polling interval can be set to 150–3000 ms. Render Free worker/memory limits still cap concurrent long-wait API requests.</p><p>Payment records are kept by unique Method + Txn ID. A successful API verification permanently sets verification_consumed; later requests stay DUPLICATE even if an Admin status field is accidentally edited.</p></section></div>
     <?php endif; ?>
     <footer class="muted" style="padding:16px 3px;font-size:10px">PAYMENT GATEWAY · SINGLE PHP ADMIN + API · FIREBASE RTDB · NO SQL</footer></main></div><?php if (in_array($tab, ['overview','monitor','devices'], true)): ?><script>setTimeout(function(){if(!document.hidden){window.location.reload();}},10000);</script><?php endif; ?></body></html><?php
 }
