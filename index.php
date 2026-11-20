@@ -601,12 +601,37 @@ function query_candidate(string $method, string $txnId, float $timeoutSeconds = 
     if (!is_array($r['json'])) return null;
     return ['path' => $path, 'key' => $key, 'record' => $r['json'], 'etag' => (string)($r['headers']['etag'] ?? '')];
 }
-function query_candidates_for_txn(string $txnId, float $timeoutSeconds, bool $allowLegacyFallback = true): array {
+function query_candidates_for_txn(string $txnId, float $timeoutSeconds, bool $allowLegacyFallback = true, string $preferredMethod = ''): array {
     $endAt = microtime(true) + max(0.2, $timeoutSeconds);
     $lookupPath = 'payment_txn_lookup/' . hash('sha256', $txnId);
     $remaining = max(0.2, $endAt - microtime(true));
-    $lookup = fb_request('GET', $lookupPath, null, [], [], min(0.8, $remaining));
-    if ($lookup['code'] < 200 || $lookup['code'] >= 300) throw new RuntimeException('Fast transaction index lookup failed (HTTP ' . $lookup['code'] . ').');
+    try {
+        $lookup = fb_request('GET', $lookupPath, null, [], [], min(0.8, $remaining));
+        if ($lookup['code'] < 200 || $lookup['code'] >= 300) throw new RuntimeException('Fast transaction index lookup failed (HTTP ' . $lookup['code'] . ').');
+    } catch (Throwable $lookupError) {
+        // The fast index is an optimization, not the source of truth. If it is
+        // temporarily unavailable, try the deterministic transaction record key.
+        // Only report an empty lookup when every attempted direct read succeeded.
+        $methods = in_array(strtolower($preferredMethod), ['bkash', 'nagad', 'rocket'], true)
+            ? [strtolower($preferredMethod)] : ['bkash', 'nagad', 'rocket'];
+        $directCandidates = [];
+        $directSuccesses = 0;
+        $directErrors = [];
+        foreach ($methods as $directMethod) {
+            $remaining = $endAt - microtime(true);
+            if ($remaining <= 0.15) break;
+            try {
+                $direct = query_candidate($directMethod, $txnId, min(1.0, max(0.2, $remaining)));
+                $directSuccesses++;
+                if ($direct !== null) $directCandidates[] = $direct;
+            } catch (Throwable $directError) {
+                $directErrors[] = $directError->getMessage();
+            }
+        }
+        if ($directCandidates) return $directCandidates;
+        if ($directSuccesses === count($methods)) return [];
+        throw new RuntimeException('Fast index and direct transaction lookup failed.');
+    }
     $lookupMap = is_array($lookup['json']) ? $lookup['json'] : [];
     $fastCandidates = [];
     foreach ($lookupMap as $method => $key) {
@@ -712,7 +737,7 @@ function api_verify(array $input): void {
         try {
             $allowLegacyFallback = $legacyFallbackAvailable;
             $legacyFallbackAvailable = false;
-            $candidates = query_candidates_for_txn($txnId, $lookupBudget, $allowLegacyFallback);
+            $candidates = query_candidates_for_txn($txnId, $lookupBudget, $allowLegacyFallback, $method);
             $successfulLookups++;
             $lastLookupSucceeded = true;
         } catch (Throwable $lookupError) {
@@ -727,8 +752,19 @@ function api_verify(array $input): void {
         }
         if (count($candidates) === 1 && empty($candidates[0]['etag'])) {
             $fastMethod = strtolower((string)($candidates[0]['record']['method'] ?? ''));
-            $liveCandidate = query_candidate($fastMethod, $txnId, max(0.25, min(1.0, $lookupBudget)));
-            $candidates = $liveCandidate === null ? [] : [$liveCandidate];
+            try {
+                $liveCandidate = query_candidate($fastMethod, $txnId, max(0.25, min(1.0, $lookupBudget)));
+                $candidates = $liveCandidate === null ? [] : [$liveCandidate];
+                $lastLookupSucceeded = true;
+            } catch (Throwable $recordLookupError) {
+                // A fast index hit is not enough: the transaction record must be
+                // read with its ETag before verification. Retry transient record
+                // lookup failures inside the configured wait window instead of
+                // aborting the request on the first Firebase timeout.
+                $lookupFailures++;
+                $lastLookupSucceeded = false;
+                $candidates = [];
+            }
         }
         if (count($candidates) > 1) verify_response(false, 'ambiguous', 'More than one transaction uses this Txn ID across payment methods. Supply the method or enable Payment method comparison.');
         if (count($candidates) === 1) {
